@@ -31,6 +31,7 @@ on:
 permissions:
   contents: read
   issues: write
+  id-token: write                    # Required by anthropics/claude-code-action for OIDC
 
 jobs:
   review:
