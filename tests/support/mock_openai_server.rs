@@ -198,15 +198,37 @@ async fn chat_completions_handler(
         .and_then(|r| r.as_str())
         .unwrap_or_default();
 
+    fn extract_text_content(msg: &Value) -> Option<String> {
+        let content = msg.get("content")?;
+        if let Some(s) = content.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(parts) = content.as_array() {
+            let mut out = String::new();
+            for part in parts {
+                if part.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && let Some(text) = part.get("text").and_then(|v| v.as_str())
+                {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(text);
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+        None
+    }
+
     let latest_user = body
         .pointer("/messages")
         .and_then(|m| m.as_array())
         .and_then(|arr| {
             arr.iter().rev().find_map(|msg| {
                 if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    msg.get("content")
-                        .and_then(|c| c.as_str())
-                        .map(ToOwned::to_owned)
+                    extract_text_content(msg)
                 } else {
                     None
                 }
@@ -215,10 +237,11 @@ async fn chat_completions_handler(
         .unwrap_or_default();
 
     let selected = if last_role == "user" {
+        let latest_user_lower = latest_user.to_ascii_lowercase();
         state
             .rules
             .iter()
-            .find(|r| latest_user.contains(&r.contains))
+            .find(|r| latest_user_lower.contains(&r.contains.to_ascii_lowercase()))
             .map(|r| r.response.clone())
             .unwrap_or_else(|| state.default_response.clone())
     } else {

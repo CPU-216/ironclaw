@@ -30,15 +30,11 @@ mod tests {
                         "name": "wf-ci-webhook-demo",
                         "description": "CI webhook workflow demo",
                         "trigger_type": "system_event",
-                        "trigger": {
-                            "source": "github",
-                            "event_type": "issue.opened",
-                            "filters": {"repository": "nearai/ironclaw"}
-                        },
+                        "event_source": "github",
+                        "event_type": "issue.opened",
+                        "event_filters": {"repository": "nearai/ironclaw"},
                         "action_type": "lightweight",
-                        "action": {
-                            "prompt": "Summarize webhook and report issue number"
-                        }
+                        "prompt": "Summarize webhook and report issue number"
                     }),
                 )]),
             ))
@@ -69,6 +65,30 @@ mod tests {
         harness
             .send_chat(&thread_id, "create workflow routine")
             .await;
+        harness
+            .wait_for_turns(&thread_id, 1, Duration::from_secs(10))
+            .await;
+
+        let mut routine = None;
+        for _ in 0..30 {
+            routine = harness.routine_by_name("wf-ci-webhook-demo").await;
+            if routine.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let routine = if let Some(r) = routine {
+            r
+        } else {
+            let history_dbg = harness.history(&thread_id).await;
+            let started_dbg = harness.test_channel.tool_calls_started();
+            let requests_dbg = mock.requests().await;
+            panic!(
+                "routine not created; tool_calls_started={started_dbg:?}; history={history_dbg}; mock_requests={requests_dbg:?}"
+            );
+        };
+        let routine_id = routine["id"].as_str().expect("routine id missing");
+
         harness.send_chat(&thread_id, "emit webhook event").await;
 
         let history = harness
@@ -76,12 +96,6 @@ mod tests {
             .await;
         let turns = history["turns"].as_array().expect("turns array missing");
         assert!(turns.len() >= 2, "expected at least 2 turns");
-
-        let routine = harness
-            .routine_by_name("wf-ci-webhook-demo")
-            .await
-            .expect("routine not created");
-        let routine_id = routine["id"].as_str().expect("routine id missing");
 
         let runs_before = harness.routine_runs(routine_id).await;
         let before_count = runs_before["runs"]
