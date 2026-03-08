@@ -32,15 +32,12 @@ fn parse_input_timestamp(
     for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(input, fmt) {
             let tz = default_tz.unwrap_or(Tz::UTC);
-            let local = naive
-                .and_local_timezone(tz)
-                .single()
-                .ok_or_else(|| {
-                    ToolError::InvalidParameters(format!(
-                        "Ambiguous or invalid datetime '{}' in timezone '{}'",
-                        input, tz
-                    ))
-                })?;
+            let local = naive.and_local_timezone(tz).single().ok_or_else(|| {
+                ToolError::InvalidParameters(format!(
+                    "Ambiguous or invalid datetime '{}' in timezone '{}'",
+                    input, tz
+                ))
+            })?;
             return Ok(local.fixed_offset());
         }
     }
@@ -429,6 +426,11 @@ mod tests {
             .execute(json!({"operation": "explode"}), &test_ctx())
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown operation"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown operation")
+        );
     }
 }

@@ -42,9 +42,7 @@ pub async fn webhook_trigger_handler(
             return false;
         }
         match &r.trigger {
-            Trigger::Webhook {
-                path: Some(wp), ..
-            } => *wp == path,
+            Trigger::Webhook { path: Some(wp), .. } => *wp == path,
             Trigger::Webhook { path: None, .. } => path == r.id.to_string(),
             _ => false,
         }
@@ -66,12 +64,11 @@ pub async fn webhook_trigger_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if !bool::from(
-            provided_secret
-                .as_bytes()
-                .ct_eq(expected_secret.as_bytes()),
-        ) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid webhook secret".to_string()));
+        if !bool::from(provided_secret.as_bytes().ct_eq(expected_secret.as_bytes())) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Invalid webhook secret".to_string(),
+            ));
         }
     }
 
@@ -89,8 +86,7 @@ pub async fn webhook_trigger_handler(
         routine.id,
         chrono::Utc::now().timestamp_millis()
     );
-    let msg =
-        IncomingMessage::new("gateway", &routine.user_id, content).with_thread(thread_id);
+    let msg = IncomingMessage::new("gateway", &routine.user_id, content).with_thread(thread_id);
 
     let tx_guard = state.msg_tx.read().await;
     let tx = tx_guard.as_ref().ok_or((
@@ -123,21 +119,15 @@ mod tests {
 
         // Matching secret
         let provided = "my-secret-token";
-        assert!(bool::from(
-            provided.as_bytes().ct_eq(expected.as_bytes())
-        ));
+        assert!(bool::from(provided.as_bytes().ct_eq(expected.as_bytes())));
 
         // Wrong secret
         let wrong = "wrong-secret";
-        assert!(!bool::from(
-            wrong.as_bytes().ct_eq(expected.as_bytes())
-        ));
+        assert!(!bool::from(wrong.as_bytes().ct_eq(expected.as_bytes())));
 
         // Empty secret
         let empty = "";
-        assert!(!bool::from(
-            empty.as_bytes().ct_eq(expected.as_bytes())
-        ));
+        assert!(!bool::from(empty.as_bytes().ct_eq(expected.as_bytes())));
     }
 
     /// Verify that webhook path matching logic works for both explicit paths
@@ -177,18 +167,14 @@ mod tests {
 
         // Explicit path match
         let matches_explicit = match &routine.trigger {
-            Trigger::Webhook {
-                path: Some(wp), ..
-            } => *wp == "my-hook",
+            Trigger::Webhook { path: Some(wp), .. } => *wp == "my-hook",
             _ => false,
         };
         assert!(matches_explicit);
 
         // Should NOT match wrong path
         let matches_wrong = match &routine.trigger {
-            Trigger::Webhook {
-                path: Some(wp), ..
-            } => *wp == "other-hook",
+            Trigger::Webhook { path: Some(wp), .. } => *wp == "other-hook",
             _ => false,
         };
         assert!(!matches_wrong);
