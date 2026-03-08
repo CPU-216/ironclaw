@@ -19,13 +19,16 @@ use regex::Regex;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
+use crate::agent::Scheduler;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, next_cron_fire,
 };
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
 use crate::db::Database;
+use crate::error::RoutineError;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
+use crate::tools::ApprovalContext;
 use crate::workspace::Workspace;
 
 /// The routine execution engine.
@@ -40,6 +43,8 @@ pub struct RoutineEngine {
     running_count: Arc<AtomicUsize>,
     /// Compiled event regex cache: routine_id -> compiled regex.
     event_cache: Arc<RwLock<Vec<(Uuid, Routine, Regex)>>>,
+    /// Scheduler for dispatching jobs (FullJob mode).
+    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl RoutineEngine {
@@ -49,6 +54,7 @@ impl RoutineEngine {
         llm: Arc<dyn LlmProvider>,
         workspace: Arc<Workspace>,
         notify_tx: mpsc::Sender<OutgoingResponse>,
+        scheduler: Option<Arc<Scheduler>>,
     ) -> Self {
         Self {
             config,
@@ -58,6 +64,7 @@ impl RoutineEngine {
             notify_tx,
             running_count: Arc::new(AtomicUsize::new(0)),
             event_cache: Arc::new(RwLock::new(Vec::new())),
+            scheduler,
         }
     }
 
@@ -163,7 +170,7 @@ impl RoutineEngine {
                 continue;
             }
 
-            let detail = if let Trigger::Cron { ref schedule } = routine.trigger {
+            let detail = if let Trigger::Cron { ref schedule, .. } = routine.trigger {
                 Some(schedule.clone())
             } else {
                 None
@@ -174,23 +181,40 @@ impl RoutineEngine {
     }
 
     /// Fire a routine manually (from tool call or CLI).
-    pub async fn fire_manual(&self, routine_id: Uuid) -> Result<Uuid, String> {
+    ///
+    /// Bypasses cooldown checks (those only apply to cron/event triggers).
+    /// Still enforces enabled check and concurrent run limit.
+    pub async fn fire_manual(
+        &self,
+        routine_id: Uuid,
+        user_id: Option<&str>,
+    ) -> Result<Uuid, RoutineError> {
         let routine = self
             .store
             .get_routine(routine_id)
             .await
-            .map_err(|e| format!("DB error: {e}"))?
-            .ok_or_else(|| format!("routine {routine_id} not found"))?;
+            .map_err(|e| RoutineError::Database {
+                reason: e.to_string(),
+            })?
+            .ok_or(RoutineError::NotFound { id: routine_id })?;
+
+        // Enforce ownership when a user_id is provided (gateway calls).
+        if let Some(uid) = user_id
+            && routine.user_id != uid
+        {
+            return Err(RoutineError::NotAuthorized { id: routine_id });
+        }
 
         if !routine.enabled {
-            return Err(format!("routine '{}' is disabled", routine.name));
+            return Err(RoutineError::Disabled {
+                name: routine.name.clone(),
+            });
         }
 
         if !self.check_concurrent(&routine).await {
-            return Err(format!(
-                "routine '{}' already at max concurrent runs",
-                routine.name
-            ));
+            return Err(RoutineError::MaxConcurrent {
+                name: routine.name.clone(),
+            });
         }
 
         let run_id = Uuid::new_v4();
@@ -209,7 +233,9 @@ impl RoutineEngine {
         };
 
         if let Err(e) = self.store.create_routine_run(&run).await {
-            return Err(format!("failed to create run record: {e}"));
+            return Err(RoutineError::Database {
+                reason: format!("failed to create run record: {e}"),
+            });
         }
 
         // Execute inline for manual triggers (caller wants to wait)
@@ -219,7 +245,7 @@ impl RoutineEngine {
             workspace: self.workspace.clone(),
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
-            max_lightweight_tokens: self.config.max_lightweight_tokens,
+            scheduler: self.scheduler.clone(),
         };
 
         tokio::spawn(async move {
@@ -251,7 +277,7 @@ impl RoutineEngine {
             workspace: self.workspace.clone(),
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
-            max_lightweight_tokens: self.config.max_lightweight_tokens,
+            scheduler: self.scheduler.clone(),
         };
 
         // Record the run in DB, then spawn execution
@@ -298,7 +324,7 @@ struct EngineContext {
     workspace: Arc<Workspace>,
     notify_tx: mpsc::Sender<OutgoingResponse>,
     running_count: Arc<AtomicUsize>,
-    max_lightweight_tokens: u32,
+    scheduler: Option<Arc<Scheduler>>,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
@@ -312,14 +338,22 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             context_paths,
             max_tokens,
         } => execute_lightweight(&ctx, &routine, prompt, context_paths, *max_tokens).await,
-        RoutineAction::FullJob { description, .. } => {
-            // Full job mode: for now, execute as lightweight with the description
-            // as prompt. Full scheduler integration will come as a follow-up.
-            tracing::info!(
-                routine = %routine.name,
-                "FullJob mode executing as lightweight (scheduler integration pending)"
-            );
-            execute_lightweight(&ctx, &routine, description, &[], ctx.max_lightweight_tokens).await
+        RoutineAction::FullJob {
+            title,
+            description,
+            max_iterations,
+            tool_permissions,
+        } => {
+            execute_full_job(
+                &ctx,
+                &routine,
+                &run,
+                title,
+                description,
+                *max_iterations,
+                tool_permissions,
+            )
+            .await
         }
     };
 
@@ -331,7 +365,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         Ok(execution) => execution,
         Err(e) => {
             tracing::error!(routine = %routine.name, "Execution failed: {}", e);
-            (RunStatus::Failed, Some(e), None)
+            (RunStatus::Failed, Some(e.to_string()), None)
         }
     };
 
@@ -346,8 +380,12 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
 
     // Update routine runtime state
     let now = Utc::now();
-    let next_fire = if let Trigger::Cron { ref schedule } = routine.trigger {
-        next_cron_fire(schedule).unwrap_or(None)
+    let next_fire = if let Trigger::Cron {
+        ref schedule,
+        ref timezone,
+    } = routine.trigger
+    {
+        next_cron_fire(schedule, timezone.as_deref()).unwrap_or(None)
     } else {
         None
     };
@@ -373,6 +411,39 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         tracing::error!(routine = %routine.name, "Failed to update runtime state: {}", e);
     }
 
+    // Persist routine result to its dedicated conversation thread
+    let thread_id = match ctx
+        .store
+        .get_or_create_routine_conversation(routine.id, &routine.name, &routine.user_id)
+        .await
+    {
+        Ok(conv_id) => {
+            tracing::debug!(
+                routine = %routine.name,
+                routine_id = %routine.id,
+                conversation_id = %conv_id,
+                "Resolved routine conversation thread"
+            );
+            // Record the run result as a conversation message
+            let msg = match (&summary, status) {
+                (Some(s), _) => format!("[{}] {}: {}", run.trigger_type, status, s),
+                (None, _) => format!("[{}] {}", run.trigger_type, status),
+            };
+            if let Err(e) = ctx
+                .store
+                .add_conversation_message(conv_id, "assistant", &msg)
+                .await
+            {
+                tracing::error!(routine = %routine.name, "Failed to persist routine message: {}", e);
+            }
+            Some(conv_id.to_string())
+        }
+        Err(e) => {
+            tracing::error!(routine = %routine.name, "Failed to get routine conversation: {}", e);
+            None
+        }
+    };
+
     // Send notifications based on config
     send_notification(
         &ctx.notify_tx,
@@ -380,8 +451,91 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         &routine.name,
         status,
         summary.as_deref(),
+        thread_id.as_deref(),
     )
     .await;
+}
+
+/// Sanitize a routine name for use in workspace paths.
+/// Only keeps alphanumeric, dash, and underscore characters; replaces everything else.
+fn sanitize_routine_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Execute a full-job routine by dispatching to the scheduler.
+///
+/// Fire-and-forget: creates a job via `Scheduler::dispatch_job` (which handles
+/// creation, metadata, persistence, and scheduling), links the routine run to
+/// the job, and returns immediately. The job runs independently via the
+/// existing Worker/Scheduler with full tool access.
+async fn execute_full_job(
+    ctx: &EngineContext,
+    routine: &Routine,
+    run: &RoutineRun,
+    title: &str,
+    description: &str,
+    max_iterations: u32,
+    tool_permissions: &[String],
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    let scheduler = ctx
+        .scheduler
+        .as_ref()
+        .ok_or_else(|| RoutineError::JobDispatchFailed {
+            reason: "scheduler not available".to_string(),
+        })?;
+
+    let mut metadata = serde_json::json!({ "max_iterations": max_iterations });
+    // Carry the routine's notify config in job metadata so the message tool
+    // can resolve channel/target per-job without global state mutation.
+    if let Some(channel) = &routine.notify.channel {
+        metadata["notify_channel"] = serde_json::json!(channel);
+    }
+    metadata["notify_user"] = serde_json::json!(&routine.notify.user);
+
+    // Build approval context: UnlessAutoApproved tools are auto-approved for routines;
+    // Always tools require explicit listing in tool_permissions.
+    let approval_context = ApprovalContext::autonomous_with_tools(tool_permissions.iter().cloned());
+
+    let job_id = scheduler
+        .dispatch_job_with_context(
+            &routine.user_id,
+            title,
+            description,
+            Some(metadata),
+            approval_context,
+        )
+        .await
+        .map_err(|e| RoutineError::JobDispatchFailed {
+            reason: format!("failed to dispatch job: {e}"),
+        })?;
+
+    // Link the routine run to the dispatched job
+    if let Err(e) = ctx.store.link_routine_run_to_job(run.id, job_id).await {
+        tracing::error!(
+            routine = %routine.name,
+            "Failed to link run to job: {}", e
+        );
+    }
+
+    tracing::info!(
+        routine = %routine.name,
+        job_id = %job_id,
+        max_iterations = max_iterations,
+        "Dispatched full job for routine"
+    );
+
+    let summary = format!(
+        "Dispatched job {job_id} for full execution with tool access (max_iterations: {max_iterations})"
+    );
+    Ok((RunStatus::Ok, Some(summary), None))
 }
 
 /// Execute a lightweight routine (single LLM call).
@@ -391,7 +545,7 @@ async fn execute_lightweight(
     prompt: &str,
     context_paths: &[String],
     max_tokens: u32,
-) -> Result<(RunStatus, Option<String>, Option<i32>), String> {
+) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     // Load context from workspace
     let mut context_parts = Vec::new();
     for path in context_paths {
@@ -408,8 +562,9 @@ async fn execute_lightweight(
         }
     }
 
-    // Load routine state from workspace
-    let state_path = format!("routines/{}/state.md", routine.name);
+    // Load routine state from workspace (name sanitized to prevent path traversal)
+    let safe_name = sanitize_routine_name(&routine.name);
+    let state_path = format!("routines/{safe_name}/state.md");
     let state_content = match ctx.workspace.read(&state_path).await {
         Ok(doc) => Some(doc.content),
         Err(_) => None,
@@ -469,7 +624,9 @@ async fn execute_lightweight(
         .llm
         .complete(request)
         .await
-        .map_err(|e| format!("LLM call failed: {e}"))?;
+        .map_err(|e| RoutineError::LlmFailed {
+            reason: e.to_string(),
+        })?;
 
     let content = response.content.trim();
     let tokens_used = Some((response.input_tokens + response.output_tokens) as i32);
@@ -477,13 +634,9 @@ async fn execute_lightweight(
     // Empty content guard (same as heartbeat)
     if content.is_empty() {
         return if response.finish_reason == FinishReason::Length {
-            Err(
-                "LLM response truncated (finish_reason=length) with no content. \
-                 Model may have exhausted token budget on reasoning."
-                    .to_string(),
-            )
+            Err(RoutineError::TruncatedResponse)
         } else {
-            Err("LLM returned empty content.".to_string())
+            Err(RoutineError::EmptyResponse)
         };
     }
 
@@ -502,6 +655,7 @@ async fn send_notification(
     routine_name: &str,
     status: RunStatus,
     summary: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     let should_notify = match status {
         RunStatus::Ok => notify.on_success,
@@ -528,11 +682,14 @@ async fn send_notification(
 
     let response = OutgoingResponse {
         content: message,
-        thread_id: None,
+        thread_id: thread_id.map(String::from),
+        attachments: Vec::new(),
         metadata: serde_json::json!({
             "source": "routine",
             "routine_name": routine_name,
             "status": status.to_string(),
+            "notify_user": notify.user,
+            "notify_channel": notify.channel,
         }),
     };
 

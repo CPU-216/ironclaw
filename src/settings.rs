@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bootstrap::ironclaw_base_dir;
+
 /// User settings persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -39,6 +41,10 @@ pub struct Settings {
     /// Source for the secrets master key.
     #[serde(default)]
     pub secrets_master_key_source: KeySource,
+
+    /// Generated master key hex (env var mode only, written to .env by wizard).
+    #[serde(default, skip_serializing)]
+    pub secrets_master_key_hex: Option<String>,
 
     // === Step 3: Inference Provider ===
     /// LLM backend: "nearai", "anthropic", "openai", "ollama", "openai_compatible".
@@ -97,6 +103,10 @@ pub struct Settings {
     /// Builder configuration.
     #[serde(default)]
     pub builder: BuilderSettings,
+
+    /// Transcription configuration.
+    #[serde(default)]
+    pub transcription: Option<TranscriptionSettings>,
 }
 
 /// Source for the secrets master key.
@@ -212,10 +222,45 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub http_host: Option<String>,
 
-    /// Telegram owner user ID. When set, the bot only responds to this user.
-    /// Captured during setup by having the user message the bot.
+    /// Whether Signal channel is enabled.
     #[serde(default)]
-    pub telegram_owner_id: Option<i64>,
+    pub signal_enabled: bool,
+
+    /// Signal HTTP URL (signal-cli daemon endpoint).
+    #[serde(default)]
+    pub signal_http_url: Option<String>,
+
+    /// Signal account (E.164 phone number).
+    #[serde(default)]
+    pub signal_account: Option<String>,
+
+    /// Signal allow from list for DMs (comma-separated E.164 phone numbers).
+    /// Comma-separated identifiers: E.164 phone numbers, `*`, bare UUIDs, or `uuid:<id>` entries.
+    /// Defaults to the configured account.
+    #[serde(default)]
+    pub signal_allow_from: Option<String>,
+
+    /// Signal allow from groups (comma-separated group IDs).
+    #[serde(default)]
+    pub signal_allow_from_groups: Option<String>,
+
+    /// Signal DM policy: "open", "allowlist", or "pairing". Default: "pairing".
+    #[serde(default)]
+    pub signal_dm_policy: Option<String>,
+
+    /// Signal group policy: "allowlist", "open", or "disabled". Default: "allowlist".
+    #[serde(default)]
+    pub signal_group_policy: Option<String>,
+
+    /// Signal group allow from (comma-separated group member IDs).
+    /// If empty, inherits from signal_allow_from.
+    #[serde(default)]
+    pub signal_group_allow_from: Option<String>,
+
+    /// Per-channel owner user IDs. When set, the channel only responds to this user.
+    /// Key: channel name (e.g., "telegram"), Value: owner user ID.
+    #[serde(default)]
+    pub wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
 
     /// Enabled WASM channels by name.
     /// Channels not in this list but present in the channels directory will still load.
@@ -250,6 +295,18 @@ pub struct HeartbeatSettings {
     /// User ID to notify on heartbeat findings.
     #[serde(default)]
     pub notify_user: Option<String>,
+
+    /// Hour (0-23) when quiet hours start (heartbeat skipped).
+    #[serde(default)]
+    pub quiet_hours_start: Option<u32>,
+
+    /// Hour (0-23) when quiet hours end (heartbeat resumes).
+    #[serde(default)]
+    pub quiet_hours_end: Option<u32>,
+
+    /// Timezone for quiet hours evaluation (IANA name, e.g. "America/New_York").
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -263,6 +320,9 @@ impl Default for HeartbeatSettings {
             interval_secs: default_heartbeat_interval(),
             notify_channel: None,
             notify_user: None,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            timezone: None,
         }
     }
 }
@@ -302,6 +362,18 @@ pub struct AgentSettings {
     /// longer than this are pruned from memory.
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
+
+    /// Maximum tool-call iterations per agentic loop invocation (default: 50).
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+
+    /// When true, skip tool approval checks entirely. For benchmarks/CI.
+    #[serde(default)]
+    pub auto_approve_tools: bool,
+
+    /// Default timezone for new sessions (IANA name, e.g. "America/New_York").
+    #[serde(default = "default_timezone")]
+    pub default_timezone: String,
 }
 
 fn default_agent_name() -> String {
@@ -332,6 +404,14 @@ fn default_max_repair_attempts() -> u32 {
     3
 }
 
+fn default_max_tool_iterations() -> usize {
+    50
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -347,6 +427,9 @@ impl Default for AgentSettings {
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
+            max_tool_iterations: default_max_tool_iterations(),
+            auto_approve_tools: false,
+            default_timezone: default_timezone(),
         }
     }
 }
@@ -443,6 +526,10 @@ pub struct SandboxSettings {
     /// Additional domains to allow through the network proxy.
     #[serde(default)]
     pub extra_allowed_domains: Vec<String>,
+
+    /// Whether Claude Code sandbox mode is enabled.
+    #[serde(default)]
+    pub claude_code_enabled: bool,
 }
 
 fn default_sandbox_policy() -> String {
@@ -462,7 +549,7 @@ fn default_sandbox_cpu_shares() -> u32 {
 }
 
 fn default_sandbox_image() -> String {
-    "ghcr.io/nearai/sandbox:latest".to_string()
+    "ironclaw-worker:latest".to_string()
 }
 
 impl Default for SandboxSettings {
@@ -476,6 +563,7 @@ impl Default for SandboxSettings {
             image: default_sandbox_image(),
             auto_pull_image: true,
             extra_allowed_domains: Vec::new(),
+            claude_code_enabled: false,
         }
     }
 }
@@ -549,6 +637,14 @@ impl Default for BuilderSettings {
     }
 }
 
+/// Transcription pipeline settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionSettings {
+    /// Whether audio transcription is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 impl Settings {
     /// Reconstruct Settings from a flat key-value map (as stored in the DB).
     ///
@@ -607,10 +703,7 @@ impl Settings {
 
     /// Get the default settings file path (~/.ironclaw/settings.json).
     pub fn default_path() -> std::path::PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".ironclaw")
-            .join("settings.json")
+        ironclaw_base_dir().join("settings.json")
     }
 
     /// Load settings from disk, returning default if not found.
@@ -628,10 +721,7 @@ impl Settings {
 
     /// Default TOML config file path (~/.ironclaw/config.toml).
     pub fn default_toml_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ironclaw")
-            .join("config.toml")
+        ironclaw_base_dir().join("config.toml")
     }
 
     /// Load settings from a TOML file.
@@ -1004,28 +1094,37 @@ mod tests {
     }
 
     #[test]
-    fn test_telegram_owner_id_db_round_trip() {
+    fn test_wasm_channel_owner_ids_db_round_trip() {
         let mut settings = Settings::default();
-        settings.channels.telegram_owner_id = Some(123456789);
+        settings
+            .channels
+            .wasm_channel_owner_ids
+            .insert("telegram".to_string(), 123456789);
 
         let map = settings.to_db_map();
         let restored = Settings::from_db_map(&map);
-        assert_eq!(restored.channels.telegram_owner_id, Some(123456789));
+        assert_eq!(
+            restored.channels.wasm_channel_owner_ids.get("telegram"),
+            Some(&123456789)
+        );
     }
 
     #[test]
-    fn test_telegram_owner_id_default_none() {
+    fn test_wasm_channel_owner_ids_default_empty() {
         let settings = Settings::default();
-        assert_eq!(settings.channels.telegram_owner_id, None);
+        assert!(settings.channels.wasm_channel_owner_ids.is_empty());
     }
 
     #[test]
-    fn test_telegram_owner_id_via_set() {
+    fn test_wasm_channel_owner_ids_via_set() {
         let mut settings = Settings::default();
         settings
-            .set("channels.telegram_owner_id", "987654321")
+            .set("channels.wasm_channel_owner_ids.telegram", "987654321")
             .unwrap();
-        assert_eq!(settings.channels.telegram_owner_id, Some(987654321));
+        assert_eq!(
+            settings.channels.wasm_channel_owner_ids.get("telegram"),
+            Some(&987654321)
+        );
     }
 
     #[test]
@@ -1101,6 +1200,31 @@ mod tests {
         assert_eq!(loaded.agent.name, "toml-bot");
         assert!(loaded.heartbeat.enabled);
         assert_eq!(loaded.heartbeat.interval_secs, 900);
+    }
+
+    /// Regression test: /model command must persist selected_model to TOML config.
+    /// Prior to the fix, `set_model()` only changed the in-memory provider and the
+    /// choice was lost on restart.
+    #[test]
+    fn toml_selected_model_update_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Start with a config that has a different model.
+        let settings = Settings {
+            selected_model: Some("old-model".to_string()),
+            ..Default::default()
+        };
+        settings.save_toml(&path).unwrap();
+
+        // Simulate what persist_selected_model does: load, update, save.
+        let mut loaded = Settings::load_toml(&path).unwrap().unwrap();
+        loaded.selected_model = Some("new-model".to_string());
+        loaded.save_toml(&path).unwrap();
+
+        // Verify the change survived a reload.
+        let reloaded = Settings::load_toml(&path).unwrap().unwrap();
+        assert_eq!(reloaded.selected_model, Some("new-model".to_string()));
     }
 
     #[test]
@@ -1228,5 +1352,333 @@ mod tests {
         assert_eq!(s.tunnel.provider, Some("cloudflare".to_string()));
         assert_eq!(s.tunnel.cf_token, Some("cf_tok_xyz".to_string()));
         assert!(s.tunnel.ts_funnel);
+    }
+
+    /// Simulates the wizard recovery scenario:
+    ///
+    /// 1. A prior partial run saved steps 1-4 to the DB
+    /// 2. User re-runs the wizard, Step 1 sets a new database_url
+    /// 3. Prior settings are loaded from the DB
+    /// 4. Step 1's fresh choices must win over stale DB values
+    ///
+    /// This tests the ordering: load DB → merge_from(step1_overrides).
+    #[test]
+    fn wizard_recovery_step1_overrides_stale_db() {
+        // Simulate prior partial run (steps 1-4 completed):
+        let prior_run = Settings {
+            database_backend: Some("postgres".to_string()),
+            database_url: Some("postgres://old-host/ironclaw".to_string()),
+            llm_backend: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-4-5".to_string()),
+            embeddings: EmbeddingsSettings {
+                enabled: true,
+                provider: "openai".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Save to DB and reload (simulates persistence round-trip)
+        let db_map = prior_run.to_db_map();
+        let from_db = Settings::from_db_map(&db_map);
+
+        // Step 1 of the new wizard run: user enters a NEW database_url
+        let step1_settings = Settings {
+            database_backend: Some("postgres".to_string()),
+            database_url: Some("postgres://new-host/ironclaw".to_string()),
+            ..Settings::default()
+        };
+
+        // Wizard flow: load DB → merge_from(step1_overrides)
+        let mut current = step1_settings.clone();
+        // try_load_existing_settings: merge DB into current
+        current.merge_from(&from_db);
+        // Re-apply Step 1 choices on top
+        current.merge_from(&step1_settings);
+
+        // Step 1's fresh database_url wins over stale DB value
+        assert_eq!(
+            current.database_url,
+            Some("postgres://new-host/ironclaw".to_string()),
+            "Step 1 fresh choice must override stale DB value"
+        );
+
+        // Prior run's steps 2-4 settings are preserved
+        assert_eq!(
+            current.llm_backend,
+            Some("anthropic".to_string()),
+            "Prior run's LLM backend must be recovered"
+        );
+        assert_eq!(
+            current.selected_model,
+            Some("claude-sonnet-4-5".to_string()),
+            "Prior run's model must be recovered"
+        );
+        assert!(
+            current.embeddings.enabled,
+            "Prior run's embeddings setting must be recovered"
+        );
+    }
+
+    /// Verifies that persisting defaults doesn't clobber prior settings
+    /// when the merge ordering is correct.
+    #[test]
+    fn wizard_recovery_defaults_dont_clobber_prior() {
+        // Prior run saved non-default settings
+        let prior_run = Settings {
+            llm_backend: Some("openai".to_string()),
+            selected_model: Some("gpt-4o".to_string()),
+            heartbeat: HeartbeatSettings {
+                enabled: true,
+                interval_secs: 900,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let db_map = prior_run.to_db_map();
+        let from_db = Settings::from_db_map(&db_map);
+
+        // New wizard run: Step 1 only sets DB fields (rest is default)
+        let step1 = Settings {
+            database_backend: Some("libsql".to_string()),
+            ..Default::default()
+        };
+
+        // Correct merge ordering
+        let mut current = step1.clone();
+        current.merge_from(&from_db);
+        current.merge_from(&step1);
+
+        // Prior settings preserved (Step 1 doesn't touch these)
+        assert_eq!(current.llm_backend, Some("openai".to_string()));
+        assert_eq!(current.selected_model, Some("gpt-4o".to_string()));
+        assert!(current.heartbeat.enabled);
+        assert_eq!(current.heartbeat.interval_secs, 900);
+
+        // Step 1's choice applied
+        assert_eq!(current.database_backend, Some("libsql".to_string()));
+    }
+
+    // === QA Plan P1 - 1.2: Config round-trip tests ===
+
+    #[test]
+    fn comprehensive_db_map_round_trip() {
+        // Set a representative value in EVERY section and verify survival
+        let settings = Settings {
+            onboard_completed: true,
+            database_backend: Some("libsql".to_string()),
+            database_url: Some("postgres://host/db".to_string()),
+            llm_backend: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-4-5".to_string()),
+            openai_compatible_base_url: Some("http://vllm:8000/v1".to_string()),
+            secrets_master_key_source: KeySource::Keychain,
+            embeddings: EmbeddingsSettings {
+                enabled: true,
+                provider: "nearai".to_string(),
+                model: "text-embedding-3-large".to_string(),
+            },
+            tunnel: TunnelSettings {
+                provider: Some("ngrok".to_string()),
+                ngrok_token: Some("tok_xxx".to_string()),
+                ..Default::default()
+            },
+            channels: ChannelSettings {
+                http_enabled: true,
+                http_port: Some(9090),
+                wasm_channel_owner_ids: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("telegram".to_string(), 12345);
+                    m
+                },
+                ..Default::default()
+            },
+            heartbeat: HeartbeatSettings {
+                enabled: true,
+                interval_secs: 900,
+                ..Default::default()
+            },
+            agent: AgentSettings {
+                name: "my-bot".to_string(),
+                max_parallel_jobs: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+
+        assert!(restored.onboard_completed, "onboard_completed lost");
+        assert_eq!(
+            restored.database_backend,
+            Some("libsql".to_string()),
+            "database_backend lost"
+        );
+        assert_eq!(
+            restored.database_url,
+            Some("postgres://host/db".to_string()),
+            "database_url lost"
+        );
+        assert_eq!(
+            restored.llm_backend,
+            Some("anthropic".to_string()),
+            "llm_backend lost"
+        );
+        assert_eq!(
+            restored.selected_model,
+            Some("claude-sonnet-4-5".to_string()),
+            "selected_model lost"
+        );
+        assert_eq!(
+            restored.openai_compatible_base_url,
+            Some("http://vllm:8000/v1".to_string()),
+            "openai_compatible_base_url lost"
+        );
+        assert_eq!(
+            restored.secrets_master_key_source,
+            KeySource::Keychain,
+            "key_source lost"
+        );
+        assert!(restored.embeddings.enabled, "embeddings.enabled lost");
+        assert_eq!(
+            restored.embeddings.provider, "nearai",
+            "embeddings.provider lost"
+        );
+        assert_eq!(
+            restored.embeddings.model, "text-embedding-3-large",
+            "embeddings.model lost"
+        );
+        assert_eq!(
+            restored.tunnel.provider,
+            Some("ngrok".to_string()),
+            "tunnel.provider lost"
+        );
+        assert!(restored.channels.http_enabled, "http_enabled lost");
+        assert_eq!(restored.channels.http_port, Some(9090), "http_port lost");
+        assert_eq!(
+            restored.channels.wasm_channel_owner_ids.get("telegram"),
+            Some(&12345),
+            "wasm_channel_owner_ids lost"
+        );
+        assert!(restored.heartbeat.enabled, "heartbeat.enabled lost");
+        assert_eq!(
+            restored.heartbeat.interval_secs, 900,
+            "heartbeat.interval_secs lost"
+        );
+        assert_eq!(restored.agent.name, "my-bot", "agent.name lost");
+        assert_eq!(
+            restored.agent.max_parallel_jobs, 10,
+            "agent.max_parallel_jobs lost"
+        );
+    }
+
+    #[test]
+    fn toml_json_db_all_agree() {
+        // A config that goes through all three formats should produce the same values
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("config.toml");
+        let json_path = dir.path().join("settings.json");
+
+        let original = Settings {
+            llm_backend: Some("ollama".to_string()),
+            selected_model: Some("llama3".to_string()),
+            heartbeat: HeartbeatSettings {
+                enabled: true,
+                interval_secs: 600,
+                ..Default::default()
+            },
+            agent: AgentSettings {
+                name: "round-trip-bot".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // TOML round-trip
+        original.save_toml(&toml_path).unwrap();
+        let from_toml = Settings::load_toml(&toml_path).unwrap().unwrap();
+
+        // JSON round-trip
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        std::fs::write(&json_path, &json).unwrap();
+        let from_json = Settings::load_from(&json_path);
+
+        // DB map round-trip
+        let db_map = original.to_db_map();
+        let from_db = Settings::from_db_map(&db_map);
+
+        // All three should agree on key values
+        for (label, loaded) in [("TOML", &from_toml), ("JSON", &from_json), ("DB", &from_db)] {
+            assert_eq!(
+                loaded.llm_backend,
+                Some("ollama".to_string()),
+                "{label}: llm_backend"
+            );
+            assert_eq!(
+                loaded.selected_model,
+                Some("llama3".to_string()),
+                "{label}: selected_model"
+            );
+            assert!(loaded.heartbeat.enabled, "{label}: heartbeat.enabled");
+            assert_eq!(
+                loaded.heartbeat.interval_secs, 600,
+                "{label}: heartbeat.interval_secs"
+            );
+            assert_eq!(loaded.agent.name, "round-trip-bot", "{label}: agent.name");
+        }
+    }
+
+    #[test]
+    fn set_get_round_trip_all_documented_paths() {
+        let mut settings = Settings::default();
+
+        // Test set + get for each documented settings path
+        let test_cases: Vec<(&str, &str)> = vec![
+            ("agent.name", "test-agent"),
+            ("agent.max_parallel_jobs", "8"),
+            ("heartbeat.enabled", "true"),
+            ("heartbeat.interval_secs", "300"),
+            ("channels.http_enabled", "true"),
+            ("channels.http_port", "8081"),
+        ];
+
+        for (path, value) in &test_cases {
+            settings
+                .set(path, value)
+                .unwrap_or_else(|e| panic!("set({path}, {value}) failed: {e}"));
+            let got = settings
+                .get(path)
+                .unwrap_or_else(|| panic!("get({path}) returned None after set"));
+            assert_eq!(&got, value, "set/get round-trip failed for path '{path}'");
+        }
+    }
+
+    #[test]
+    fn option_string_fields_survive_db_round_trip_as_null() {
+        // When an Option<String> field is None, it should be stored as null
+        // and come back as None, not silently become Some("")
+        let settings = Settings {
+            database_url: None,
+            llm_backend: None,
+            selected_model: None,
+            openai_compatible_base_url: None,
+            ..Default::default()
+        };
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+
+        assert_eq!(
+            restored.database_url, None,
+            "None database_url should stay None"
+        );
+        assert_eq!(
+            restored.llm_backend, None,
+            "None llm_backend should stay None"
+        );
+        assert_eq!(
+            restored.selected_model, None,
+            "None selected_model should stay None"
+        );
     }
 }

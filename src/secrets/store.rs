@@ -129,6 +129,7 @@ impl SecretsStore for PostgresSecretsStore {
     }
 
     async fn get(&self, user_id: &str, name: &str) -> Result<Secret, SecretError> {
+        let name = name.to_lowercase();
         let client = self
             .pool
             .get()
@@ -176,6 +177,7 @@ impl SecretsStore for PostgresSecretsStore {
     }
 
     async fn exists(&self, user_id: &str, name: &str) -> Result<bool, SecretError> {
+        let name = name.to_lowercase();
         let client = self
             .pool
             .get()
@@ -218,6 +220,7 @@ impl SecretsStore for PostgresSecretsStore {
     }
 
     async fn delete(&self, user_id: &str, name: &str) -> Result<bool, SecretError> {
+        let name = name.to_lowercase();
         let client = self
             .pool
             .get()
@@ -263,21 +266,23 @@ impl SecretsStore for PostgresSecretsStore {
         secret_name: &str,
         allowed_secrets: &[String],
     ) -> Result<bool, SecretError> {
+        let secret_name_lower = secret_name.to_lowercase();
         // First check if the secret exists
-        if !self.exists(user_id, secret_name).await? {
+        if !self.exists(user_id, &secret_name_lower).await? {
             return Ok(false);
         }
 
         // Check if secret is in the allowed list
         // Supports glob patterns: "openai_*" matches "openai_api_key"
         for pattern in allowed_secrets {
-            if pattern == secret_name {
+            let pattern_lower = pattern.to_lowercase();
+            if pattern_lower == secret_name_lower {
                 return Ok(true);
             }
 
             // Simple glob: * matches any suffix
-            if let Some(prefix) = pattern.strip_suffix('*')
-                && secret_name.starts_with(prefix)
+            if let Some(prefix) = pattern_lower.strip_suffix('*')
+                && secret_name_lower.starts_with(prefix)
             {
                 return Ok(true);
             }
@@ -415,6 +420,7 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn get(&self, user_id: &str, name: &str) -> Result<Secret, SecretError> {
+        let name = name.to_lowercase();
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
@@ -424,7 +430,7 @@ impl SecretsStore for LibSqlSecretsStore {
                 FROM secrets
                 WHERE user_id = ?1 AND name = ?2
                 "#,
-                libsql::params![user_id, name],
+                libsql::params![user_id, name.as_str()],
             )
             .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
@@ -460,11 +466,12 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn exists(&self, user_id: &str, name: &str) -> Result<bool, SecretError> {
+        let name = name.to_lowercase();
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
                 "SELECT 1 FROM secrets WHERE user_id = ?1 AND name = ?2",
-                libsql::params![user_id, name],
+                libsql::params![user_id, name.as_str()],
             )
             .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
@@ -501,11 +508,12 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn delete(&self, user_id: &str, name: &str) -> Result<bool, SecretError> {
+        let name = name.to_lowercase();
         let conn = self.connect().await?;
         let affected = conn
             .execute(
                 "DELETE FROM secrets WHERE user_id = ?1 AND name = ?2",
-                libsql::params![user_id, name],
+                libsql::params![user_id, name.as_str()],
             )
             .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
@@ -537,17 +545,19 @@ impl SecretsStore for LibSqlSecretsStore {
         secret_name: &str,
         allowed_secrets: &[String],
     ) -> Result<bool, SecretError> {
-        if !self.exists(user_id, secret_name).await? {
+        let secret_name_lower = secret_name.to_lowercase();
+        if !self.exists(user_id, &secret_name_lower).await? {
             return Ok(false);
         }
 
         for pattern in allowed_secrets {
-            if pattern == secret_name {
+            let pattern_lower = pattern.to_lowercase();
+            if pattern_lower == secret_name_lower {
                 return Ok(true);
             }
 
-            if let Some(prefix) = pattern.strip_suffix('*')
-                && secret_name.starts_with(prefix)
+            if let Some(prefix) = pattern_lower.strip_suffix('*')
+                && secret_name_lower.starts_with(prefix)
             {
                 return Ok(true);
             }
@@ -635,9 +645,10 @@ fn libsql_row_to_secret(row: &libsql::Row) -> Result<Secret, SecretError> {
     })
 }
 
-/// In-memory implementation for testing.
-#[cfg(test)]
-pub mod testing {
+/// In-memory secrets store. Used for testing and as a fallback when no
+/// persistent secrets backend is configured (extension listing/install still
+/// works, but stored secrets won't survive a restart).
+pub mod in_memory {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -700,13 +711,14 @@ pub mod testing {
         }
 
         async fn get(&self, user_id: &str, name: &str) -> Result<Secret, SecretError> {
+            let name = name.to_lowercase();
             let secret = self
                 .secrets
                 .read()
                 .await
-                .get(&(user_id.to_string(), name.to_string()))
+                .get(&(user_id.to_string(), name.clone()))
                 .cloned()
-                .ok_or_else(|| SecretError::NotFound(name.to_string()))?;
+                .ok_or_else(|| SecretError::NotFound(name.clone()))?;
 
             if let Some(expires_at) = secret.expires_at
                 && expires_at < Utc::now()
@@ -732,7 +744,7 @@ pub mod testing {
                 .secrets
                 .read()
                 .await
-                .contains_key(&(user_id.to_string(), name.to_string())))
+                .contains_key(&(user_id.to_string(), name.to_lowercase())))
         }
 
         async fn list(&self, user_id: &str) -> Result<Vec<SecretRef>, SecretError> {
@@ -754,7 +766,7 @@ pub mod testing {
                 .secrets
                 .write()
                 .await
-                .remove(&(user_id.to_string(), name.to_string()))
+                .remove(&(user_id.to_string(), name.to_lowercase()))
                 .is_some())
         }
 
@@ -768,15 +780,17 @@ pub mod testing {
             secret_name: &str,
             allowed_secrets: &[String],
         ) -> Result<bool, SecretError> {
-            if !self.exists(user_id, secret_name).await? {
+            let secret_name_lower = secret_name.to_lowercase();
+            if !self.exists(user_id, &secret_name_lower).await? {
                 return Ok(false);
             }
             for pattern in allowed_secrets {
-                if pattern == secret_name {
+                let pattern_lower = pattern.to_lowercase();
+                if pattern_lower == secret_name_lower {
                     return Ok(true);
                 }
-                if let Some(prefix) = pattern.strip_suffix('*')
-                    && secret_name.starts_with(prefix)
+                if let Some(prefix) = pattern_lower.strip_suffix('*')
+                    && secret_name_lower.starts_with(prefix)
                 {
                     return Ok(true);
                 }
@@ -794,7 +808,7 @@ mod tests {
 
     use crate::secrets::crypto::SecretsCrypto;
     use crate::secrets::store::SecretsStore;
-    use crate::secrets::store::testing::InMemorySecretsStore;
+    use crate::secrets::store::in_memory::InMemorySecretsStore;
     use crate::secrets::types::CreateSecretParams;
 
     fn test_store() -> InMemorySecretsStore {

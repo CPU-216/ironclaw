@@ -156,8 +156,15 @@ async fn handle_client_message(
     direct_tx: &mpsc::Sender<WsServerMessage>,
 ) {
     match msg {
-        WsClientMessage::Message { content, thread_id } => {
+        WsClientMessage::Message {
+            content,
+            thread_id,
+            timezone,
+        } => {
             let mut incoming = IncomingMessage::new("gateway", user_id, &content);
+            if let Some(ref tz) = timezone {
+                incoming = incoming.with_timezone(tz);
+            }
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
             }
@@ -242,7 +249,7 @@ async fn handle_client_message(
         } => {
             if let Some(ref ext_mgr) = state.extension_manager {
                 match ext_mgr.auth(&extension_name, Some(&token)).await {
-                    Ok(result) if result.status == "authenticated" => {
+                    Ok(result) if result.is_authenticated() => {
                         let msg = match ext_mgr.activate(&extension_name).await {
                             Ok(r) => format!(
                                 "{} authenticated ({} tools loaded)",
@@ -268,9 +275,9 @@ async fn handle_client_message(
                             .sse
                             .broadcast(crate::channels::web::types::SseEvent::AuthRequired {
                                 extension_name,
-                                instructions: result.instructions,
-                                auth_url: result.auth_url,
-                                setup_url: result.setup_url,
+                                instructions: result.instructions().map(String::from),
+                                auth_url: result.auth_url().map(String::from),
+                                setup_url: result.setup_url().map(String::from),
                             });
                     }
                     Err(e) => {
@@ -349,6 +356,7 @@ mod tests {
             WsClientMessage::Message {
                 content: "hello agent".to_string(),
                 thread_id: Some("t1".to_string()),
+                timezone: None,
             },
             &state,
             "user1",
@@ -373,6 +381,7 @@ mod tests {
             WsClientMessage::Message {
                 content: "hello".to_string(),
                 thread_id: None,
+                timezone: None,
             },
             &state,
             "user1",
@@ -477,11 +486,13 @@ mod tests {
             workspace: None,
             session_manager: None,
             log_broadcaster: None,
+            log_level_handle: None,
             extension_manager: None,
             tool_registry: None,
             store: None,
             job_manager: None,
             prompt_queue: None,
+            scheduler: None,
             user_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
@@ -489,6 +500,10 @@ mod tests {
             skill_registry: None,
             skill_catalog: None,
             chat_rate_limiter: crate::channels::web::server::RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
         }
     }
 }

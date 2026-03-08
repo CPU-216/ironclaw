@@ -1,7 +1,24 @@
 {
+  "version": "0.2.0",
+  "wit_version": "0.3.0",
   "type": "channel",
   "name": "discord",
   "description": "Discord Gateway/Webhook channel for handling slash commands, buttons, and messages",
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "discord_bot_token",
+        "prompt": "Enter your Discord Bot Token. Find it under Bot > Token in your Discord Application settings.",
+        "optional": false
+      },
+      {
+        "name": "discord_public_key",
+        "prompt": "Enter your Discord Application Public Key (found under General Information in your Discord Application settings).",
+        "optional": false
+      }
+    ],
+    "setup_url": "https://discord.com/developers/applications"
+  },
   "capabilities": {
     "http": {
       "allowlist": [
@@ -10,7 +27,7 @@
       "credentials": {
         "discord_bot_token": {
           "secret_name": "discord_bot_token",
-          "location": { "type": "header", "header_name": "Authorization", "prefix": "Bot " },
+          "location": { "type": "header", "name": "Authorization", "prefix": "Bot " },
           "host_patterns": ["discord.com"]
         }
       },
@@ -30,10 +47,16 @@
       "emit_rate_limit": {
         "messages_per_minute": 100,
         "messages_per_hour": 5000
+      },
+      "webhook": {
+        "signature_key_secret_name": "discord_public_key"
       }
     }
   },
   "config": {
-    "require_signature_verification": true
+    "require_signature_verification": true,
+    "owner_id": null,
+    "dm_policy": "pairing",
+    "allow_from": []
   }
 }

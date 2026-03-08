@@ -3,21 +3,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::join_all;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
+use crate::channels::web::types::SseEvent;
 use crate::context::{ContextManager, JobState};
 use crate::db::Database;
 use crate::error::Error;
 use crate::hooks::HookRegistry;
 use crate::llm::{
-    ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
+    ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolCall,
+    ToolSelection,
 };
 use crate::safety::SafetyLayer;
-use crate::tools::ToolRegistry;
+use crate::tools::rate_limiter::RateLimitResult;
+use crate::tools::{ApprovalContext, ToolRegistry, redact_params};
 
 /// Shared dependencies for worker execution.
 ///
@@ -33,6 +36,14 @@ pub struct WorkerDeps {
     pub hooks: Arc<HookRegistry>,
     pub timeout: Duration,
     pub use_planning: bool,
+    /// SSE broadcast sender for live job event streaming to the web gateway.
+    pub sse_tx: Option<tokio::sync::broadcast::Sender<SseEvent>>,
+    /// Approval context for tool execution. When `None`, all non-`Never` tools are
+    /// blocked (legacy behavior). When `Some`, the context determines which tools
+    /// are pre-approved for autonomous execution.
+    pub approval_context: Option<ApprovalContext>,
+    /// HTTP interceptor for trace recording/replay (propagated to JobContext).
+    pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
 }
 
 /// Worker that executes a single job.
@@ -97,6 +108,92 @@ impl Worker {
         }
     }
 
+    /// Fire-and-forget persistence of a job event and SSE broadcast.
+    fn log_event(&self, event_type: &str, data: serde_json::Value) {
+        let job_id = self.job_id;
+
+        // Persist to DB
+        if let Some(store) = self.store() {
+            let store = store.clone();
+            let et = event_type.to_string();
+            let d = data.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.save_job_event(job_id, &et, &d).await {
+                    tracing::warn!("Failed to persist event for job {}: {}", job_id, e);
+                }
+            });
+        }
+
+        // Broadcast SSE for live web UI updates
+        if let Some(ref tx) = self.deps.sse_tx {
+            let job_id_str = job_id.to_string();
+            let event = match event_type {
+                "message" => Some(SseEvent::JobMessage {
+                    job_id: job_id_str,
+                    role: data
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("assistant")
+                        .to_string(),
+                    content: data
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                "tool_use" => Some(SseEvent::JobToolUse {
+                    job_id: job_id_str,
+                    tool_name: data
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    input: data
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                }),
+                "tool_result" => Some(SseEvent::JobToolResult {
+                    job_id: job_id_str,
+                    tool_name: data
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    output: data
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                "status" => Some(SseEvent::JobStatus {
+                    job_id: job_id_str,
+                    message: data
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                "result" => Some(SseEvent::JobResult {
+                    job_id: job_id_str,
+                    status: data
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("completed")
+                        .to_string(),
+                    session_id: data
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                }),
+                _ => None,
+            };
+            if let Some(event) = event {
+                let _ = tx.send(event);
+            }
+        }
+    }
+
     /// Run the worker until the job is complete or stopped.
     pub async fn run(self, mut rx: mpsc::Receiver<WorkerMessage>) -> Result<(), Error> {
         tracing::info!("Worker starting for job {}", self.job_id);
@@ -108,14 +205,14 @@ impl Worker {
                 tracing::debug!("Worker for job {} stopped before starting", self.job_id);
                 return Ok(());
             }
-            Some(WorkerMessage::Ping) => {}
+            Some(WorkerMessage::Ping) | Some(WorkerMessage::UserMessage(_)) => {}
         }
 
         // Get job context
         let job_ctx = self.context_manager().get_context(self.job_id).await?;
 
         // Create reasoning engine
-        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
+        let reasoning = Reasoning::new(self.llm().clone());
 
         // Build initial reasoning context (tool definitions refreshed each iteration in execution_loop)
         let mut reason_ctx = ReasoningContext::new().with_job(&job_ctx.description);
@@ -143,6 +240,40 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         match result {
             Ok(Ok(())) => {
                 tracing::info!("Worker for job {} completed successfully", self.job_id);
+                // Only mark completed if still in an active, non-stuck state.
+                // The execution_loop may have already called mark_completed or
+                // mark_stuck (e.g. "plan completed but work remains").
+                let current_state = self
+                    .context_manager()
+                    .get_context(self.job_id)
+                    .await
+                    .map(|ctx| ctx.state);
+                match current_state {
+                    Ok(state) if state.is_terminal() => {
+                        // Already in a terminal state (e.g. execution_loop
+                        // called mark_completed itself).
+                    }
+                    Ok(JobState::Completed) => {
+                        // execution_loop already called mark_completed.
+                    }
+                    Ok(JobState::Stuck) => {
+                        // execution_loop marked this as stuck (e.g. "plan
+                        // completed but work remains"); leave for self-repair.
+                        tracing::info!(
+                            "Job {} returned Ok but is Stuck — leaving for self-repair",
+                            self.job_id
+                        );
+                    }
+                    Ok(_) => {
+                        self.mark_completed().await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %self.job_id,
+                            "Failed to get job context, cannot mark as completed: {}", e
+                        );
+                    }
+                }
             }
             Ok(Err(e)) => {
                 tracing::error!("Worker for job {} failed: {}", self.job_id, e);
@@ -163,8 +294,20 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
     ) -> Result<(), Error> {
-        let max_iterations = 50;
+        const MAX_WORKER_ITERATIONS: usize = 500;
+        let max_iterations = self
+            .context_manager()
+            .get_context(self.job_id)
+            .await
+            .ok()
+            .and_then(|ctx| ctx.metadata.get("max_iterations").and_then(|v| v.as_u64()))
+            .unwrap_or(50) as usize;
+        let max_iterations = max_iterations.min(MAX_WORKER_ITERATIONS);
         let mut iteration = 0;
+        const MAX_CONSECUTIVE_RATE_LIMITS: usize = 10;
+        let mut consecutive_rate_limits = 0usize;
+        const MAX_TOOL_INTENT_NUDGES: u32 = 2;
+        let mut consecutive_tool_intent_nudges: u32 = 0;
 
         // Initial tool definitions for planning (will be refreshed in loop)
         reason_ctx.available_tools = self.tools().tool_definitions().await;
@@ -192,6 +335,14 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             .join("\n")
                     )));
 
+                    self.log_event("message", serde_json::json!({
+                        "role": "assistant",
+                        "content": format!("Plan: {}\n\n{}", p.goal,
+                            p.actions.iter().enumerate()
+                                .map(|(i, a)| format!("{}. {} - {}", i + 1, a.tool_name, a.reasoning))
+                                .collect::<Vec<_>>().join("\n"))
+                    }));
+
                     Some(p)
                 }
                 Err(e) => {
@@ -207,15 +358,29 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             None
         };
 
-        // If we have a plan, execute it
+        // If we have a plan, execute it. Two exit paths:
+        // 1. Plan ran to completion → job is Completed or needs continuation
+        //    (check state and only fall through if not terminal)
+        // 2. Plan was interrupted by UserMessage → fall through to direct loop
         if let Some(ref plan) = plan {
-            return self.execute_plan(rx, reasoning, reason_ctx, plan).await;
+            self.execute_plan(rx, reasoning, reason_ctx, plan).await?;
+
+            // If the plan marked the job completed, terminal, or stuck, we're
+            // done. Only fall through to the direct selection loop if the
+            // plan was interrupted or explicitly left the job in-progress.
+            if let Ok(ctx) = self.context_manager().get_context(self.job_id).await
+                && (ctx.state.is_terminal()
+                    || ctx.state == JobState::Stuck
+                    || ctx.state == JobState::Completed)
+            {
+                return Ok(());
+            }
         }
 
-        // Otherwise, use direct tool selection loop
+        // Direct tool selection loop (also used as fallback after plan interruption)
         loop {
-            // Check for stop signal
-            if let Ok(msg) = rx.try_recv() {
+            // Check for stop signal and injected user messages
+            while let Ok(msg) = rx.try_recv() {
                 match msg {
                     WorkerMessage::Stop => {
                         tracing::debug!("Worker for job {} received stop signal", self.job_id);
@@ -225,6 +390,20 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         tracing::trace!("Worker for job {} received ping", self.job_id);
                     }
                     WorkerMessage::Start => {}
+                    WorkerMessage::UserMessage(content) => {
+                        tracing::info!(
+                            job_id = %self.job_id,
+                            "Worker received follow-up user message"
+                        );
+                        reason_ctx.messages.push(ChatMessage::user(&content));
+                        self.log_event(
+                            "message",
+                            serde_json::json!({
+                                "role": "user",
+                                "content": content,
+                            }),
+                        );
+                    }
                 }
             }
 
@@ -245,12 +424,64 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             // Refresh tool definitions so newly built tools become visible
             reason_ctx.available_tools = self.tools().tool_definitions().await;
 
-            // Select next tool(s) to use
-            let selections = reasoning.select_tools(reason_ctx).await?;
+            // Select next tool(s) to use, with rate-limit retry.
+            let selections = match reasoning.select_tools(reason_ctx).await {
+                Ok(s) => s,
+                Err(crate::error::LlmError::RateLimited { retry_after, .. }) => {
+                    consecutive_rate_limits += 1;
+                    let wait = retry_after.unwrap_or(Duration::from_secs(5));
+                    tracing::warn!(
+                        job_id = %self.job_id,
+                        wait_secs = wait.as_secs(),
+                        attempt = consecutive_rate_limits,
+                        "LLM rate limited during tool selection, backing off"
+                    );
+                    if consecutive_rate_limits >= MAX_CONSECUTIVE_RATE_LIMITS {
+                        self.mark_stuck("Persistent rate limiting").await?;
+                        return Ok(());
+                    }
+                    self.log_event(
+                        "status",
+                        serde_json::json!({
+                            "message": format!("Rate limited, retrying in {}s ({}/{})...",
+                                wait.as_secs(), consecutive_rate_limits, MAX_CONSECUTIVE_RATE_LIMITS),
+                        }),
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             if selections.is_empty() {
                 // No tools from select_tools, ask LLM directly (may still return tool calls)
-                let respond_output = reasoning.respond_with_tools(reason_ctx).await?;
+                let respond_output = match reasoning.respond_with_tools(reason_ctx).await {
+                    Ok(o) => o,
+                    Err(crate::error::LlmError::RateLimited { retry_after, .. }) => {
+                        consecutive_rate_limits += 1;
+                        let wait = retry_after.unwrap_or(Duration::from_secs(5));
+                        tracing::warn!(
+                            job_id = %self.job_id,
+                            wait_secs = wait.as_secs(),
+                            attempt = consecutive_rate_limits,
+                            "LLM rate limited during respond_with_tools, backing off"
+                        );
+                        if consecutive_rate_limits >= MAX_CONSECUTIVE_RATE_LIMITS {
+                            self.mark_stuck("Persistent rate limiting").await?;
+                            return Ok(());
+                        }
+                        self.log_event(
+                            "status",
+                            serde_json::json!({
+                                "message": format!("Rate limited, retrying in {}s ({}/{})...",
+                                    wait.as_secs(), consecutive_rate_limits, MAX_CONSECUTIVE_RATE_LIMITS),
+                            }),
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 match respond_output.result {
                     RespondResult::Text(response) => {
@@ -266,23 +497,58 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         // Add assistant response to context
                         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
-                        // Give it one more chance to select a tool
-                        if iteration > 3 && iteration % 5 == 0 {
-                            reason_ctx.messages.push(ChatMessage::user(
-                                "Are you stuck? Do you need help completing this job?",
-                            ));
+                        self.log_event(
+                            "message",
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": response,
+                            }),
+                        );
+
+                        // Nudge the LLM if it expressed tool intent without calling tools
+                        let signals_intent = !reason_ctx.available_tools.is_empty()
+                            && crate::llm::llm_signals_tool_intent(&response);
+                        if signals_intent && consecutive_tool_intent_nudges < MAX_TOOL_INTENT_NUDGES
+                        {
+                            consecutive_tool_intent_nudges += 1;
+                            tracing::info!(
+                                job_id = %self.job_id,
+                                "LLM expressed tool intent without calling a tool, nudging"
+                            );
+                            reason_ctx
+                                .messages
+                                .push(ChatMessage::user(crate::llm::TOOL_INTENT_NUDGE));
+                        } else if !signals_intent {
+                            consecutive_tool_intent_nudges = 0;
+                            if iteration > 3 && iteration % 5 == 0 {
+                                // Generic fallback nudge
+                                reason_ctx.messages.push(ChatMessage::user(
+                                    "Are you stuck? Do you need help completing this job?",
+                                ));
+                            }
                         }
                     }
                     RespondResult::ToolCalls {
                         tool_calls,
                         content,
                     } => {
+                        consecutive_tool_intent_nudges = 0;
                         // Model returned tool calls - execute them
                         tracing::debug!(
                             "Job {} respond_with_tools returned {} tool calls",
                             self.job_id,
                             tool_calls.len()
                         );
+
+                        if let Some(ref text) = content {
+                            self.log_event(
+                                "message",
+                                serde_json::json!({
+                                    "role": "assistant",
+                                    "content": text,
+                                }),
+                            );
+                        }
 
                         // Add assistant message with tool_calls (OpenAI protocol)
                         reason_ctx
@@ -292,79 +558,151 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                                 tool_calls.clone(),
                             ));
 
-                        for tc in tool_calls {
-                            let result = self.execute_tool(&tc.name, &tc.arguments).await;
-
-                            // Create synthetic selection for process_tool_result
-                            let selection = ToolSelection {
+                        // Convert ToolCalls to ToolSelections and execute in parallel
+                        let selections: Vec<ToolSelection> = tool_calls
+                            .iter()
+                            .map(|tc| ToolSelection {
                                 tool_name: tc.name.clone(),
                                 parameters: tc.arguments.clone(),
                                 reasoning: String::new(),
                                 alternatives: vec![],
                                 tool_call_id: tc.id.clone(),
-                            };
+                            })
+                            .collect();
 
-                            self.process_tool_result(reason_ctx, &selection, result)
+                        let results = self.execute_tools_parallel(&selections).await;
+                        for (selection, result) in selections.iter().zip(results) {
+                            self.process_tool_result(reason_ctx, selection, result.result)
                                 .await?;
                         }
                     }
                 }
-            } else if selections.len() == 1 {
-                // Single tool: execute directly
-                let selection = &selections[0];
-                tracing::debug!(
-                    "Job {} selecting tool: {} - {}",
-                    self.job_id,
-                    selection.tool_name,
-                    selection.reasoning
-                );
-
-                let result = self
-                    .execute_tool(&selection.tool_name, &selection.parameters)
-                    .await;
-
-                self.process_tool_result(reason_ctx, selection, result)
-                    .await?;
             } else {
-                // Multiple tools: execute in parallel
-                tracing::debug!(
-                    "Job {} executing {} tools in parallel",
-                    self.job_id,
-                    selections.len()
-                );
+                consecutive_tool_intent_nudges = 0;
 
-                let results = self.execute_tools_parallel(&selections).await;
+                // Record the assistant tool_calls message so that tool_result
+                // messages have a matching parent (prevents orphaned rewrites).
+                let tool_calls: Vec<ToolCall> = selections
+                    .iter()
+                    .map(|s| ToolCall {
+                        id: s.tool_call_id.clone(),
+                        name: s.tool_name.clone(),
+                        arguments: s.parameters.clone(),
+                    })
+                    .collect();
+                reason_ctx
+                    .messages
+                    .push(ChatMessage::assistant_with_tool_calls(None, tool_calls));
 
-                // Process all results
-                for (selection, result) in selections.iter().zip(results) {
-                    self.process_tool_result(reason_ctx, selection, result.result)
+                if selections.len() == 1 {
+                    // Single tool: execute directly
+                    let selection = &selections[0];
+                    tracing::debug!(
+                        "Job {} selecting tool: {} - {}",
+                        self.job_id,
+                        selection.tool_name,
+                        selection.reasoning
+                    );
+
+                    let result = self
+                        .execute_tool(&selection.tool_name, &selection.parameters)
+                        .await;
+
+                    self.process_tool_result(reason_ctx, selection, result)
                         .await?;
+                } else {
+                    // Multiple tools: execute in parallel
+                    tracing::debug!(
+                        "Job {} executing {} tools in parallel",
+                        self.job_id,
+                        selections.len()
+                    );
+
+                    let results = self.execute_tools_parallel(&selections).await;
+
+                    // Process all results
+                    for (selection, result) in selections.iter().zip(results) {
+                        self.process_tool_result(reason_ctx, selection, result.result)
+                            .await?;
+                    }
                 }
             }
+
+            // Reset rate-limit counter after a successful iteration (all LLM
+            // calls succeeded). Placed here so alternating success/fail between
+            // select_tools and respond_with_tools cannot bypass the cap.
+            consecutive_rate_limits = 0;
 
             // Small delay between iterations
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    /// Execute multiple tools in parallel.
+    /// Execute multiple tools in parallel using a JoinSet.
+    ///
+    /// Each task is tagged with its original index so results are returned
+    /// in the same order as `selections`, regardless of completion order.
     async fn execute_tools_parallel(&self, selections: &[ToolSelection]) -> Vec<ToolExecResult> {
-        let futures: Vec<_> = selections
-            .iter()
-            .map(|selection| {
-                let tool_name = selection.tool_name.clone();
-                let params = selection.parameters.clone();
-                let deps = self.deps.clone();
-                let job_id = self.job_id;
+        let count = selections.len();
 
-                async move {
-                    let result = Self::execute_tool_inner(&deps, job_id, &tool_name, &params).await;
-                    ToolExecResult { result }
+        // Short-circuit for single tool: execute directly without JoinSet overhead
+        if count <= 1 {
+            let mut results = Vec::with_capacity(count);
+            for selection in selections {
+                let result = Self::execute_tool_inner(
+                    &self.deps,
+                    self.job_id,
+                    &selection.tool_name,
+                    &selection.parameters,
+                )
+                .await;
+                results.push(ToolExecResult { result });
+            }
+            return results;
+        }
+
+        let mut join_set = JoinSet::new();
+
+        for (idx, selection) in selections.iter().enumerate() {
+            let deps = self.deps.clone();
+            let job_id = self.job_id;
+            let tool_name = selection.tool_name.clone();
+            let params = selection.parameters.clone();
+            join_set.spawn(async move {
+                let result = Self::execute_tool_inner(&deps, job_id, &tool_name, &params).await;
+                (idx, ToolExecResult { result })
+            });
+        }
+
+        // Collect and reorder by original index
+        let mut results: Vec<Option<ToolExecResult>> = (0..count).map(|_| None).collect();
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((idx, exec_result)) => results[idx] = Some(exec_result),
+                Err(e) => {
+                    if e.is_panic() {
+                        tracing::error!("Tool execution task panicked: {}", e);
+                    } else {
+                        tracing::error!("Tool execution task cancelled: {}", e);
+                    }
                 }
-            })
-            .collect();
+            }
+        }
 
-        join_all(futures).await
+        // Fill any panicked slots with error results
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.unwrap_or_else(|| ToolExecResult {
+                    result: Err(crate::error::ToolError::ExecutionFailed {
+                        name: selections[i].tool_name.clone(),
+                        reason: "Task failed during execution".to_string(),
+                    }
+                    .into()),
+                })
+            })
+            .collect()
     }
 
     /// Inner tool execution logic that can be called from both single and parallel paths.
@@ -382,23 +720,46 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     name: tool_name.to_string(),
                 })?;
 
-        // Tools requiring approval are blocked in autonomous jobs
-        if tool.requires_approval() {
+        // Check approval: use context-aware check if available, else block all non-Never tools
+        let requirement = tool.requires_approval(params);
+        let blocked =
+            ApprovalContext::is_blocked_or_default(&deps.approval_context, tool_name, requirement);
+        if blocked {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }
             .into());
         }
 
-        // Fetch job context early so we have the real user_id for hooks
-        let job_ctx = deps.context_manager.get_context(job_id).await?;
+        // Fetch job context early so we have the real user_id for hooks and rate limiting
+        let mut job_ctx = deps.context_manager.get_context(job_id).await?;
+        // Propagate http_interceptor for trace recording/replay
+        if job_ctx.http_interceptor.is_none() {
+            job_ctx.http_interceptor = deps.http_interceptor.clone();
+        }
+
+        // Check per-tool rate limit before running hooks or executing (cheaper check first)
+        if let Some(config) = tool.rate_limit_config()
+            && let RateLimitResult::Limited { retry_after, .. } = deps
+                .tools
+                .rate_limiter()
+                .check_and_record(&job_ctx.user_id, tool_name, &config)
+                .await
+        {
+            return Err(crate::error::ToolError::RateLimited {
+                name: tool_name.to_string(),
+                retry_after: Some(retry_after),
+            }
+            .into());
+        }
 
         // Run BeforeToolCall hook
         let params = {
             use crate::hooks::{HookError, HookEvent, HookOutcome};
+            let hook_params = redact_params(params, tool.sensitive_params());
             let event = HookEvent::ToolCall {
                 tool_name: tool_name.to_string(),
-                parameters: params.clone(),
+                parameters: hook_params,
                 user_id: job_ctx.user_id.clone(),
                 context: format!("job:{}", job_id),
             };
@@ -454,9 +815,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             .into());
         }
 
+        // Redact sensitive parameter values (e.g. secret_save's "value") before
+        // they touch any observability or audit path.
+        let safe_params = redact_params(&params, tool.sensitive_params());
         tracing::debug!(
             tool = %tool_name,
-            params = %params,
+            params = %safe_params,
             job = %job_id,
             "Tool call started"
         );
@@ -505,9 +869,10 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 let output_str = serde_json::to_string_pretty(&output.result)
                     .ok()
                     .map(|s| deps.safety.sanitize_tool_output(tool_name, &s).content);
-                deps.context_manager
+                match deps
+                    .context_manager
                     .update_memory(job_id, |mem| {
-                        let rec = mem.create_action(tool_name, params.clone()).succeed(
+                        let rec = mem.create_action(tool_name, safe_params.clone()).succeed(
                             output_str.clone(),
                             output.result.clone(),
                             elapsed,
@@ -516,30 +881,52 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         rec
                     })
                     .await
-                    .ok()
+                {
+                    Ok(rec) => Some(rec),
+                    Err(e) => {
+                        tracing::warn!(job_id = %job_id, tool = tool_name, "Failed to record action in memory: {e}");
+                        None
+                    }
+                }
             }
-            Ok(Err(e)) => deps
-                .context_manager
-                .update_memory(job_id, |mem| {
-                    let rec = mem
-                        .create_action(tool_name, params.clone())
-                        .fail(e.to_string(), elapsed);
-                    mem.record_action(rec.clone());
-                    rec
-                })
-                .await
-                .ok(),
-            Err(_) => deps
-                .context_manager
-                .update_memory(job_id, |mem| {
-                    let rec = mem
-                        .create_action(tool_name, params.clone())
-                        .fail("Execution timeout", elapsed);
-                    mem.record_action(rec.clone());
-                    rec
-                })
-                .await
-                .ok(),
+            Ok(Err(e)) => {
+                match deps
+                    .context_manager
+                    .update_memory(job_id, |mem| {
+                        let rec = mem
+                            .create_action(tool_name, safe_params.clone())
+                            .fail(e.to_string(), elapsed);
+                        mem.record_action(rec.clone());
+                        rec
+                    })
+                    .await
+                {
+                    Ok(rec) => Some(rec),
+                    Err(e) => {
+                        tracing::warn!(job_id = %job_id, tool = tool_name, "Failed to record action in memory: {e}");
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                match deps
+                    .context_manager
+                    .update_memory(job_id, |mem| {
+                        let rec = mem
+                            .create_action(tool_name, safe_params.clone())
+                            .fail("Execution timeout", elapsed);
+                        mem.record_action(rec.clone());
+                        rec
+                    })
+                    .await
+                {
+                    Ok(rec) => Some(rec),
+                    Err(e) => {
+                        tracing::warn!(job_id = %job_id, tool = tool_name, "Failed to record action in memory: {e}");
+                        None
+                    }
+                }
+            }
         };
 
         // Persist action to database (fire-and-forget)
@@ -579,6 +966,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         selection: &ToolSelection,
         result: Result<String, Error>,
     ) -> Result<bool, Error> {
+        self.log_event(
+            "tool_use",
+            serde_json::json!({
+                "tool_name": selection.tool_name,
+                "input": crate::agent::agent_loop::truncate_for_preview(
+                    &selection.parameters.to_string(), 500),
+            }),
+        );
+
         match result {
             Ok(output) => {
                 // Sanitize output
@@ -598,6 +994,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     &selection.tool_name,
                     wrapped,
                 ));
+
+                self.log_event("tool_result", serde_json::json!({
+                    "tool_name": selection.tool_name,
+                    "success": true,
+                    "output": crate::agent::agent_loop::truncate_for_preview(&sanitized.content, 500),
+                }));
 
                 // Tool output never drives job completion. A malicious tool could
                 // emit "TASK_COMPLETE" to force premature completion. Only the LLM's
@@ -625,6 +1027,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     });
                 }
 
+                self.log_event(
+                    "tool_result",
+                    serde_json::json!({
+                        "tool_name": selection.tool_name,
+                        "success": false,
+                        "output": format!("Error: {}", e),
+                    }),
+                );
+
                 reason_ctx.messages.push(ChatMessage::tool_result(
                     &selection.tool_call_id,
                     &selection.tool_name,
@@ -645,8 +1056,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         plan: &ActionPlan,
     ) -> Result<(), Error> {
         for (i, action) in plan.actions.iter().enumerate() {
-            // Check for stop signal
-            if let Ok(msg) = rx.try_recv() {
+            // Check for stop signal and injected user messages
+            while let Ok(msg) = rx.try_recv() {
                 match msg {
                     WorkerMessage::Stop => {
                         tracing::debug!(
@@ -659,6 +1070,29 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         tracing::trace!("Worker for job {} received ping", self.job_id);
                     }
                     WorkerMessage::Start => {}
+                    WorkerMessage::UserMessage(content) => {
+                        tracing::info!(
+                            job_id = %self.job_id,
+                            "User message received during plan execution, abandoning plan"
+                        );
+                        reason_ctx.messages.push(ChatMessage::user(&content));
+                        self.log_event(
+                            "message",
+                            serde_json::json!({
+                                "role": "user",
+                                "content": content,
+                            }),
+                        );
+                        self.log_event(
+                            "status",
+                            serde_json::json!({
+                                "message": "Plan interrupted by user message, re-evaluating...",
+                            }),
+                        );
+                        // Return Ok to break out of plan; caller falls through to
+                        // the direct selection loop for LLM re-evaluation.
+                        return Ok(());
+                    }
                 }
             }
 
@@ -671,11 +1105,6 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 action.reasoning
             );
 
-            // Execute the planned tool
-            let result = self
-                .execute_tool(&action.tool_name, &action.parameters)
-                .await;
-
             // Create a synthetic ToolSelection for process_tool_result.
             // Plan actions don't originate from an LLM tool_call response so
             // there is no real tool_call_id; generate a unique one.
@@ -686,6 +1115,24 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 alternatives: vec![],
                 tool_call_id: format!("plan_{}_{}", self.job_id, i),
             };
+
+            // Record the assistant tool_calls message so that the tool_result
+            // has a matching parent (prevents orphaned rewrites).
+            reason_ctx
+                .messages
+                .push(ChatMessage::assistant_with_tool_calls(
+                    None,
+                    vec![ToolCall {
+                        id: selection.tool_call_id.clone(),
+                        name: selection.tool_name.clone(),
+                        arguments: selection.parameters.clone(),
+                    }],
+                ));
+
+            // Execute the planned tool
+            let result = self
+                .execute_tool(&action.tool_name, &action.parameters)
+                .await;
 
             // Process the result
             let completed = self
@@ -711,14 +1158,18 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         if crate::util::llm_signals_completion(&response) {
             self.mark_completed().await?;
         } else {
-            // Job not complete, could re-plan or fall back to direct selection
+            // Job not complete — return Ok without marking terminal so the
+            // caller falls through to the direct selection loop for continuation.
             tracing::info!(
                 "Job {} plan completed but work remains, falling back to direct selection",
                 self.job_id
             );
-            // Continue with standard execution loop by returning (will be picked up by main loop)
-            self.mark_stuck("Plan completed but job incomplete - needs re-planning")
-                .await?;
+            self.log_event(
+                "status",
+                serde_json::json!({
+                    "message": "Plan completed but job needs more work, continuing...",
+                }),
+            );
         }
 
         Ok(())
@@ -746,6 +1197,14 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        self.log_event(
+            "result",
+            serde_json::json!({
+                "status": "completed",
+                "success": true,
+                "message": "Job completed successfully",
+            }),
+        );
         self.persist_status(
             JobState::Completed,
             Some("Job completed successfully".to_string()),
@@ -764,6 +1223,14 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        self.log_event(
+            "result",
+            serde_json::json!({
+                "status": "failed",
+                "success": false,
+                "message": format!("Execution failed: {}", reason),
+            }),
+        );
         self.persist_status(JobState::Failed, Some(reason.to_string()));
         Ok(())
     }
@@ -777,6 +1244,14 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        self.log_event(
+            "result",
+            serde_json::json!({
+                "status": "stuck",
+                "success": false,
+                "message": format!("Job stuck: {}", reason),
+            }),
+        );
         self.persist_status(JobState::Stuck, Some(reason.to_string()));
         Ok(())
     }
@@ -799,6 +1274,105 @@ impl From<TaskOutput> for Result<String, Error> {
 mod tests {
     use crate::llm::ToolSelection;
     use crate::util::llm_signals_completion;
+
+    use super::*;
+    use crate::config::SafetyConfig;
+    use crate::context::JobContext;
+    use crate::llm::{
+        CompletionRequest, CompletionResponse, LlmProvider, ToolCompletionRequest,
+        ToolCompletionResponse,
+    };
+    use crate::safety::SafetyLayer;
+    use crate::tools::{Tool, ToolError, ToolOutput};
+
+    /// A test tool that sleeps for a configurable duration before returning.
+    struct SlowTool {
+        tool_name: String,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+        fn description(&self) -> &str {
+            "Test tool with configurable delay"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let start = std::time::Instant::now();
+            tokio::time::sleep(self.delay).await;
+            Ok(ToolOutput::text(
+                format!("done_{}", self.tool_name),
+                start.elapsed(),
+            ))
+        }
+        fn requires_sanitization(&self) -> bool {
+            false
+        }
+    }
+
+    /// Stub LLM provider (never called in these tests).
+    struct StubLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for StubLlm {
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+        fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
+            (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            unimplemented!("stub")
+        }
+        async fn complete_with_tools(
+            &self,
+            _req: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            unimplemented!("stub")
+        }
+    }
+
+    /// Build a Worker wired to a ToolRegistry containing the given tools.
+    async fn make_worker(tools: Vec<Arc<dyn Tool>>) -> Worker {
+        let registry = ToolRegistry::new();
+        for t in tools {
+            registry.register(t).await;
+        }
+
+        let cm = Arc::new(crate::context::ContextManager::new(5));
+        let job_id = cm.create_job("test", "test job").await.unwrap();
+
+        let deps = WorkerDeps {
+            context_manager: cm,
+            llm: Arc::new(StubLlm),
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: false,
+            })),
+            tools: Arc::new(registry),
+            store: None,
+            hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            timeout: Duration::from_secs(30),
+            use_planning: false,
+            sse_tx: None,
+            approval_context: None,
+            http_interceptor: None,
+        };
+
+        Worker::new(job_id, deps)
+    }
 
     #[test]
     fn test_tool_selection_preserves_call_id() {
@@ -875,5 +1449,317 @@ mod tests {
         assert!(!llm_signals_completion(
             "The tool returned: TASK_COMPLETE signal"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_parallel_speedup() {
+        // 3 tools each sleeping 200ms should finish in roughly 200ms (parallel),
+        // not ~600ms (sequential).
+        let tools: Vec<Arc<dyn Tool>> = (0..3)
+            .map(|i| {
+                Arc::new(SlowTool {
+                    tool_name: format!("slow_{}", i),
+                    delay: Duration::from_millis(200),
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+
+        let worker = make_worker(tools).await;
+
+        let selections: Vec<ToolSelection> = (0..3)
+            .map(|i| ToolSelection {
+                tool_name: format!("slow_{}", i),
+                parameters: serde_json::json!({}),
+                reasoning: String::new(),
+                alternatives: vec![],
+                tool_call_id: format!("call_{}", i),
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let results = worker.execute_tools_parallel(&selections).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.result.is_ok(), "Tool should succeed");
+        }
+        // Parallel should complete well under the sequential 600ms threshold.
+        // Use a generous bound (800ms) to avoid flaky failures on slow CI runners,
+        // while still proving parallelism (sequential would be >= 600ms on any machine).
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "Parallel execution took {:?}, expected < 800ms (sequential would be ~600ms)",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_result_ordering_preserved() {
+        // Tools with different delays finish in different order.
+        // Results must be returned in the original request order.
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(SlowTool {
+                tool_name: "tool_a".into(),
+                delay: Duration::from_millis(300),
+            }),
+            Arc::new(SlowTool {
+                tool_name: "tool_b".into(),
+                delay: Duration::from_millis(100),
+            }),
+            Arc::new(SlowTool {
+                tool_name: "tool_c".into(),
+                delay: Duration::from_millis(200),
+            }),
+        ];
+
+        let worker = make_worker(tools).await;
+
+        let selections = vec![
+            ToolSelection {
+                tool_name: "tool_a".into(),
+                parameters: serde_json::json!({}),
+                reasoning: String::new(),
+                alternatives: vec![],
+                tool_call_id: "call_a".into(),
+            },
+            ToolSelection {
+                tool_name: "tool_b".into(),
+                parameters: serde_json::json!({}),
+                reasoning: String::new(),
+                alternatives: vec![],
+                tool_call_id: "call_b".into(),
+            },
+            ToolSelection {
+                tool_name: "tool_c".into(),
+                parameters: serde_json::json!({}),
+                reasoning: String::new(),
+                alternatives: vec![],
+                tool_call_id: "call_c".into(),
+            },
+        ];
+
+        let results = worker.execute_tools_parallel(&selections).await;
+
+        // Results must be in same order as selections, not completion order.
+        assert!(results[0].result.as_ref().unwrap().contains("done_tool_a"));
+        assert!(results[1].result.as_ref().unwrap().contains("done_tool_b"));
+        assert!(results[2].result.as_ref().unwrap().contains("done_tool_c"));
+    }
+
+    #[tokio::test]
+    async fn test_missing_tool_produces_error_not_panic() {
+        // If a tool doesn't exist, the result slot should contain an error.
+        let worker = make_worker(vec![]).await;
+
+        let selections = vec![ToolSelection {
+            tool_name: "nonexistent_tool".into(),
+            parameters: serde_json::json!({}),
+            reasoning: String::new(),
+            alternatives: vec![],
+            tool_call_id: "call_x".into(),
+        }];
+
+        let results = worker.execute_tools_parallel(&selections).await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].result.is_err(),
+            "Missing tool should produce an error, not a panic"
+        );
+    }
+
+    /// Verify that calling mark_completed on an already-Completed job returns
+    /// an error (Completed → Completed is an invalid state transition).
+    #[tokio::test]
+    async fn test_mark_completed_twice_returns_error() {
+        let worker = make_worker(vec![]).await;
+
+        // Transition to InProgress first (required by state machine)
+        worker
+            .context_manager()
+            .update_context(worker.job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First mark_completed should succeed
+        worker.mark_completed().await.unwrap();
+
+        // Verify state is Completed
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap();
+        assert_eq!(ctx.state, JobState::Completed);
+
+        // Second mark_completed should fail (Completed → Completed is invalid)
+        let result = worker.mark_completed().await;
+        assert!(
+            result.is_err(),
+            "Completed → Completed transition should be rejected by state machine"
+        );
+    }
+
+    /// Build a Worker with the given approval context.
+    async fn make_worker_with_approval(
+        tools: Vec<Arc<dyn Tool>>,
+        approval_context: Option<crate::tools::ApprovalContext>,
+    ) -> Worker {
+        let registry = ToolRegistry::new();
+        for t in tools {
+            registry.register(t).await;
+        }
+
+        let cm = Arc::new(crate::context::ContextManager::new(5));
+        let job_id = cm.create_job("test", "test job").await.unwrap();
+
+        let deps = WorkerDeps {
+            context_manager: cm,
+            llm: Arc::new(StubLlm),
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: false,
+            })),
+            tools: Arc::new(registry),
+            store: None,
+            hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            timeout: Duration::from_secs(30),
+            use_planning: false,
+            sse_tx: None,
+            approval_context,
+            http_interceptor: None,
+        };
+
+        Worker::new(job_id, deps)
+    }
+
+    /// A tool that requires approval (UnlessAutoApproved).
+    struct ApprovalTool;
+
+    #[async_trait::async_trait]
+    impl Tool for ApprovalTool {
+        fn name(&self) -> &str {
+            "needs_approval"
+        }
+        fn description(&self) -> &str {
+            "Tool requiring approval"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::text(
+                "approved",
+                std::time::Instant::now().elapsed(),
+            ))
+        }
+        fn requires_approval(
+            &self,
+            _params: &serde_json::Value,
+        ) -> crate::tools::ApprovalRequirement {
+            crate::tools::ApprovalRequirement::UnlessAutoApproved
+        }
+        fn requires_sanitization(&self) -> bool {
+            false
+        }
+    }
+
+    /// A tool that always requires approval.
+    struct AlwaysApprovalTool;
+
+    #[async_trait::async_trait]
+    impl Tool for AlwaysApprovalTool {
+        fn name(&self) -> &str {
+            "always_approval"
+        }
+        fn description(&self) -> &str {
+            "Tool always requiring approval"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::text(
+                "always",
+                std::time::Instant::now().elapsed(),
+            ))
+        }
+        fn requires_approval(
+            &self,
+            _params: &serde_json::Value,
+        ) -> crate::tools::ApprovalRequirement {
+            crate::tools::ApprovalRequirement::Always
+        }
+        fn requires_sanitization(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn test_approval_context_unblocks_unless_auto_approved() {
+        // Without approval context, UnlessAutoApproved is blocked
+        let worker_blocked = make_worker_with_approval(vec![Arc::new(ApprovalTool)], None).await;
+        let result = worker_blocked
+            .execute_tool("needs_approval", &serde_json::json!({}))
+            .await;
+        assert!(
+            result.is_err(),
+            "Should be blocked without approval context"
+        );
+
+        // With autonomous approval context, UnlessAutoApproved is allowed
+        let worker_allowed = make_worker_with_approval(
+            vec![Arc::new(ApprovalTool)],
+            Some(crate::tools::ApprovalContext::autonomous()),
+        )
+        .await;
+        let result = worker_allowed
+            .execute_tool("needs_approval", &serde_json::json!({}))
+            .await;
+        assert!(result.is_ok(), "Should be allowed with autonomous context");
+    }
+
+    #[tokio::test]
+    async fn test_approval_context_blocks_always_unless_permitted() {
+        // Autonomous context without tool_permissions blocks Always tools
+        let worker_blocked = make_worker_with_approval(
+            vec![Arc::new(AlwaysApprovalTool)],
+            Some(crate::tools::ApprovalContext::autonomous()),
+        )
+        .await;
+        let result = worker_blocked
+            .execute_tool("always_approval", &serde_json::json!({}))
+            .await;
+        assert!(
+            result.is_err(),
+            "Always tool should be blocked without permission"
+        );
+
+        // Autonomous context with tool_permissions allows Always tools
+        let worker_allowed = make_worker_with_approval(
+            vec![Arc::new(AlwaysApprovalTool)],
+            Some(crate::tools::ApprovalContext::autonomous_with_tools([
+                "always_approval".to_string(),
+            ])),
+        )
+        .await;
+        let result = worker_allowed
+            .execute_tool("always_approval", &serde_json::json!({}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "Always tool should be allowed with permission"
+        );
     }
 }

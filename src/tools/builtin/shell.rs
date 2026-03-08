@@ -55,7 +55,9 @@ use tokio::process::Command;
 
 use crate::context::JobContext;
 use crate::sandbox::{SandboxManager, SandboxPolicy};
-use crate::tools::tool::{Tool, ToolDomain, ToolError, ToolOutput, require_str};
+use crate::tools::tool::{
+    ApprovalRequirement, Tool, ToolDomain, ToolError, ToolOutput, require_str,
+};
 
 /// Maximum output size before truncation (64KB).
 const MAX_OUTPUT_SIZE: usize = 64 * 1024;
@@ -507,25 +509,47 @@ impl ShellTool {
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn command: {}", e)))?;
 
-        // Wait with timeout
+        // Drain stdout/stderr concurrently with wait() to prevent deadlocks.
+        // If we call wait() without draining the pipes and the child's output
+        // exceeds the OS pipe buffer (64KB Linux, 16KB macOS), the child blocks
+        // on write and wait() never returns.
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
         let result = tokio::time::timeout(timeout, async {
-            let status = child.wait().await?;
+            let stdout_fut = async {
+                if let Some(mut out) = stdout_handle {
+                    let mut buf = Vec::new();
+                    (&mut out)
+                        .take(MAX_OUTPUT_SIZE as u64)
+                        .read_to_end(&mut buf)
+                        .await
+                        .ok();
+                    // Drain any remaining output so the child does not block
+                    tokio::io::copy(&mut out, &mut tokio::io::sink()).await.ok();
+                    String::from_utf8_lossy(&buf).to_string()
+                } else {
+                    String::new()
+                }
+            };
 
-            // Read stdout
-            let mut stdout = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                let mut buf = vec![0u8; MAX_OUTPUT_SIZE];
-                let n = out.read(&mut buf).await.unwrap_or(0);
-                stdout = String::from_utf8_lossy(&buf[..n]).to_string();
-            }
+            let stderr_fut = async {
+                if let Some(mut err) = stderr_handle {
+                    let mut buf = Vec::new();
+                    (&mut err)
+                        .take(MAX_OUTPUT_SIZE as u64)
+                        .read_to_end(&mut buf)
+                        .await
+                        .ok();
+                    tokio::io::copy(&mut err, &mut tokio::io::sink()).await.ok();
+                    String::from_utf8_lossy(&buf).to_string()
+                } else {
+                    String::new()
+                }
+            };
 
-            // Read stderr
-            let mut stderr = String::new();
-            if let Some(mut err) = child.stderr.take() {
-                let mut buf = vec![0u8; MAX_OUTPUT_SIZE];
-                let n = err.read(&mut buf).await.unwrap_or(0);
-                stderr = String::from_utf8_lossy(&buf[..n]).to_string();
-            }
+            let (stdout, stderr, wait_result) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+            let status = wait_result?;
 
             // Combine output
             let output = if stderr.is_empty() {
@@ -674,11 +698,7 @@ impl Tool for ShellTool {
         Ok(ToolOutput::success(result, duration))
     }
 
-    fn requires_approval(&self) -> bool {
-        true // Shell commands should require approval
-    }
-
-    fn requires_approval_for(&self, params: &serde_json::Value) -> bool {
+    fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
         let cmd = params
             .get("command")
             .and_then(|c| c.as_str().map(String::from))
@@ -692,10 +712,10 @@ impl Tool for ShellTool {
         if let Some(ref cmd) = cmd
             && requires_explicit_approval(cmd)
         {
-            return true;
+            return ApprovalRequirement::Always;
         }
 
-        false
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -704,6 +724,10 @@ impl Tool for ShellTool {
 
     fn domain(&self) -> ToolDomain {
         ToolDomain::Container
+    }
+
+    fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
+        Some(crate::tools::tool::ToolRateLimitConfig::new(30, 300))
     }
 }
 
@@ -839,31 +863,46 @@ mod tests {
     }
 
     #[test]
-    fn test_requires_approval_for_destructive_command() {
+    fn test_requires_approval_destructive_command() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ShellTool::new();
-        // Destructive commands must return true even though shell already
-        // requires base approval -- the distinction matters for auto-approve override.
-        assert!(tool.requires_approval_for(&serde_json::json!({"command": "rm -rf /tmp"})));
-        assert!(tool.requires_approval_for(
-            &serde_json::json!({"command": "git push --force origin main"})
-        ));
-        assert!(tool.requires_approval_for(&serde_json::json!({"command": "DROP TABLE users;"})));
+        // Destructive commands must return Always to bypass auto-approve.
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({"command": "rm -rf /tmp"})),
+            ApprovalRequirement::Always
+        );
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({"command": "git push --force origin main"})),
+            ApprovalRequirement::Always
+        );
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({"command": "DROP TABLE users;"})),
+            ApprovalRequirement::Always
+        );
     }
 
     #[test]
-    fn test_requires_approval_for_safe_command() {
+    fn test_requires_approval_safe_command() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ShellTool::new();
-        // Safe commands should not override auto-approval; only destructive ones do.
-        assert!(!tool.requires_approval_for(&serde_json::json!({"command": "cargo build"})));
-        assert!(!tool.requires_approval_for(&serde_json::json!({"command": "echo hello"})));
+        // Safe commands return UnlessAutoApproved (can be auto-approved).
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({"command": "cargo build"})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({"command": "echo hello"})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
     }
 
     #[test]
-    fn test_requires_approval_for_string_encoded_args() {
+    fn test_requires_approval_string_encoded_args() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ShellTool::new();
         // When arguments are string-encoded JSON (rare LLM behavior).
         let args = serde_json::Value::String(r#"{"command": "rm -rf /tmp/stuff"}"#.to_string());
-        assert!(tool.requires_approval_for(&args));
+        assert_eq!(tool.requires_approval(&args), ApprovalRequirement::Always);
     }
 
     #[test]
@@ -1185,6 +1224,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_large_output_command() {
+        let tool = ShellTool::new().with_timeout(Duration::from_secs(10));
+        let ctx = JobContext::default();
+
+        // Generate output larger than OS pipe buffer (64KB on Linux, 16KB on macOS).
+        // Without draining pipes before wait(), this would deadlock.
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "python3 -c \"print('A' * 131072)\""}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let output = result.result.get("output").unwrap().as_str().unwrap();
+        assert_eq!(output.len(), MAX_OUTPUT_SIZE);
+        assert_eq!(result.result.get("exit_code").unwrap().as_i64().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn test_netcat_blocked_at_execution() {
         let tool = ShellTool::new();
         let ctx = JobContext::default();
@@ -1200,5 +1259,120 @@ mod tests {
             matches!(result, Err(ToolError::NotAuthorized(ref msg)) if msg.contains("injection")),
             "Expected NotAuthorized with injection message, got: {result:?}"
         );
+    }
+
+    // === QA Plan P1 - 2.5: Realistic shell tool tests ===
+    // These tests use Value::Object args (how the LLM actually sends them)
+    // and cover edge cases that caused real bugs.
+
+    #[tokio::test]
+    async fn test_blocked_command_with_object_args() {
+        // Regression: PR #72 - destructive command check used .as_str() on
+        // Value::Object, which always returned None, bypassing the check.
+        let tool = ShellTool::new();
+        let ctx = JobContext::default();
+
+        let result = tool
+            .execute(serde_json::json!({"command": "rm -rf /"}), &ctx)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "rm -rf / with Object args must be blocked, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_injection_blocked_with_object_args() {
+        let tool = ShellTool::new();
+        let ctx = JobContext::default();
+
+        // Command injection via base64 decode piped to shell
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo cm0gLXJmIC8= | base64 -d | sh"}),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::NotAuthorized(_))),
+            "base64-to-shell injection must be blocked: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_scrubbing_custom_var_hidden() {
+        // Verify that arbitrary env vars from the parent process
+        // are NOT visible to child commands (end-to-end, not just unit).
+        let tool = ShellTool::new();
+        let ctx = JobContext::default();
+
+        // Set a fake secret in the parent process env
+        unsafe { std::env::set_var("IRONCLAW_QA_TEST_SECRET", "supersecret123") };
+
+        let result = tool
+            .execute(serde_json::json!({"command": "env"}), &ctx)
+            .await
+            .unwrap();
+
+        let output = result.result.get("output").unwrap().as_str().unwrap();
+        assert!(
+            !output.contains("IRONCLAW_QA_TEST_SECRET"),
+            "env scrubbing must hide non-safe vars from child processes"
+        );
+        assert!(
+            !output.contains("supersecret123"),
+            "secret value must not appear in child env output"
+        );
+
+        // Clean up
+        unsafe { std::env::remove_var("IRONCLAW_QA_TEST_SECRET") };
+    }
+
+    #[tokio::test]
+    async fn test_env_scrubbing_path_preserved() {
+        // PATH must be preserved for commands to resolve
+        let tool = ShellTool::new();
+        let ctx = JobContext::default();
+
+        let result = tool
+            .execute(serde_json::json!({"command": "env"}), &ctx)
+            .await
+            .unwrap();
+
+        let output = result.result.get("output").unwrap().as_str().unwrap();
+        assert!(
+            output.contains("PATH="),
+            "PATH must be preserved in child env"
+        );
+    }
+
+    #[test]
+    fn test_injection_encoded_to_absolute_path_shell() {
+        // Encoding + pipe to shell via absolute path must be detected
+        assert!(detect_command_injection("echo cm0gLXJmIC8= | base64 -d | /bin/sh").is_some());
+        assert!(detect_command_injection("echo cm0gLXJmIC8= | base64 -d | /bin/bash").is_some());
+    }
+
+    #[test]
+    fn test_injection_false_positives_avoided() {
+        // Normal commands must NOT trigger injection detection
+        assert!(detect_command_injection("cargo build --release").is_none());
+        assert!(detect_command_injection("git push origin main").is_none());
+        assert!(detect_command_injection("echo hello world").is_none());
+        assert!(detect_command_injection("ls -la /tmp").is_none());
+        assert!(detect_command_injection("cat README.md | head -20").is_none());
+        assert!(detect_command_injection("grep -r 'pattern' src/").is_none());
+        assert!(detect_command_injection("python3 -c \"print('hello')\"").is_none());
+        assert!(detect_command_injection("docker ps --format '{{.Names}}'").is_none());
+    }
+
+    #[test]
+    fn test_approval_with_mixed_case_destructive() {
+        // Case-insensitive destructive command detection
+        assert!(requires_explicit_approval("RM -RF /tmp"));
+        assert!(requires_explicit_approval("Git Push --Force origin main"));
+        assert!(requires_explicit_approval("DROP table users;"));
     }
 }

@@ -43,11 +43,13 @@ async fn start_test_server() -> (
         workspace: None,
         session_manager: None,
         log_broadcaster: None,
+        log_level_handle: None,
         extension_manager: None,
         tool_registry: None,
         store: None,
         job_manager: None,
         prompt_queue: None,
+        scheduler: None,
         user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
@@ -55,6 +57,10 @@ async fn start_test_server() -> (
         skill_registry: None,
         skill_catalog: None,
         chat_rate_limiter: ironclaw::channels::web::server::RateLimiter::new(30, 60),
+        registry_entries: Vec::new(),
+        cost_guard: None,
+        routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+        startup_time: std::time::Instant::now(),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -307,6 +313,8 @@ async fn test_ws_multiple_events_in_sequence() {
     state.sse.broadcast(SseEvent::ToolCompleted {
         name: "shell".to_string(),
         success: true,
+        error: None,
+        parameters: None,
         thread_id: None,
     });
     state.sse.broadcast(SseEvent::Response {

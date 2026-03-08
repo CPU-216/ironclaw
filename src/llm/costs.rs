@@ -10,6 +10,12 @@ use rust_decimal_macros::dec;
 ///
 /// Returns `Some((input_cost, output_cost))` for known models, `None` otherwise.
 pub fn model_cost(model_id: &str) -> Option<(Decimal, Decimal)> {
+    // OpenRouter free-tier models: `:free` suffix or the `openrouter/free` router
+    // should always report zero cost (see #463).
+    if model_id.ends_with(":free") || model_id == "openrouter/free" || model_id == "free" {
+        return Some((Decimal::ZERO, Decimal::ZERO));
+    }
+
     // Normalize: strip provider prefixes (e.g., "openai/gpt-4o" -> "gpt-4o")
     let id = model_id
         .rsplit_once('/')
@@ -17,7 +23,17 @@ pub fn model_cost(model_id: &str) -> Option<(Decimal, Decimal)> {
         .unwrap_or(model_id);
 
     match id {
-        // OpenAI models -- prices per token (USD)
+        // OpenAI — GPT-5.x / Codex
+        "gpt-5.3-codex" | "gpt-5.3-codex-spark" => Some((dec!(0.000002), dec!(0.000008))),
+        "gpt-5.2-codex" | "gpt-5.2-pro" | "gpt-5.2" => Some((dec!(0.000002), dec!(0.000008))),
+        "gpt-5.1-codex" | "gpt-5.1-codex-max" | "gpt-5.1" => Some((dec!(0.000002), dec!(0.000008))),
+        "gpt-5.1-codex-mini" => Some((dec!(0.0000003), dec!(0.0000012))),
+        "gpt-5-codex" | "gpt-5-pro" | "gpt-5" => Some((dec!(0.000002), dec!(0.000008))),
+        "gpt-5-mini" | "gpt-5-nano" => Some((dec!(0.0000003), dec!(0.0000012))),
+        // OpenAI — GPT-4.x
+        "gpt-4.1" => Some((dec!(0.000002), dec!(0.000008))),
+        "gpt-4.1-mini" => Some((dec!(0.0000004), dec!(0.0000016))),
+        "gpt-4.1-nano" => Some((dec!(0.0000001), dec!(0.0000004))),
         "gpt-4o" | "gpt-4o-2024-11-20" | "gpt-4o-2024-08-06" => {
             Some((dec!(0.0000025), dec!(0.00001)))
         }
@@ -25,20 +41,36 @@ pub fn model_cost(model_id: &str) -> Option<(Decimal, Decimal)> {
         "gpt-4-turbo" | "gpt-4-turbo-2024-04-09" => Some((dec!(0.00001), dec!(0.00003))),
         "gpt-4" | "gpt-4-0613" => Some((dec!(0.00003), dec!(0.00006))),
         "gpt-3.5-turbo" | "gpt-3.5-turbo-0125" => Some((dec!(0.0000005), dec!(0.0000015))),
+        // OpenAI — reasoning
+        "o3" => Some((dec!(0.000002), dec!(0.000008))),
+        "o3-mini" | "o3-mini-2025-01-31" => Some((dec!(0.0000011), dec!(0.0000044))),
+        "o4-mini" => Some((dec!(0.0000011), dec!(0.0000044))),
         "o1" | "o1-2024-12-17" => Some((dec!(0.000015), dec!(0.00006))),
         "o1-mini" | "o1-mini-2024-09-12" => Some((dec!(0.000003), dec!(0.000012))),
-        "o3-mini" | "o3-mini-2025-01-31" => Some((dec!(0.0000011), dec!(0.0000044))),
 
-        // Anthropic models
-        "claude-3-5-sonnet-20241022" | "claude-3-5-sonnet-latest" | "claude-sonnet-4-20250514" => {
-            Some((dec!(0.000003), dec!(0.000015)))
-        }
-        "claude-3-5-haiku-20241022" | "claude-3-5-haiku-latest" => {
-            Some((dec!(0.0000008), dec!(0.000004)))
-        }
-        "claude-3-opus-20240229" | "claude-3-opus-latest" | "claude-opus-4-20250514" => {
-            Some((dec!(0.000015), dec!(0.000075)))
-        }
+        // Anthropic
+        "claude-opus-4-6"
+        | "claude-opus-4-5"
+        | "claude-opus-4-5-20251101"
+        | "claude-opus-4-1"
+        | "claude-opus-4-1-20250805"
+        | "claude-opus-4-0"
+        | "claude-opus-4-20250514"
+        | "claude-3-opus-20240229"
+        | "claude-3-opus-latest" => Some((dec!(0.000015), dec!(0.000075))),
+        "claude-sonnet-4-6"
+        | "claude-sonnet-4-5"
+        | "claude-sonnet-4-5-20250929"
+        | "claude-sonnet-4-0"
+        | "claude-sonnet-4-20250514"
+        | "claude-3-7-sonnet-20250219"
+        | "claude-3-7-sonnet-latest"
+        | "claude-3-5-sonnet-20241022"
+        | "claude-3-5-sonnet-latest" => Some((dec!(0.000003), dec!(0.000015))),
+        "claude-haiku-4-5"
+        | "claude-haiku-4-5-20251001"
+        | "claude-3-5-haiku-20241022"
+        | "claude-3-5-haiku-latest" => Some((dec!(0.0000008), dec!(0.000004))),
         "claude-3-haiku-20240307" => Some((dec!(0.00000025), dec!(0.00000125))),
 
         // Ollama / local models -- free
@@ -120,5 +152,45 @@ mod tests {
     fn test_provider_prefix_stripped() {
         // "openai/gpt-4o" should resolve to same as "gpt-4o"
         assert_eq!(model_cost("openai/gpt-4o"), model_cost("gpt-4o"));
+    }
+
+    #[test]
+    fn test_openrouter_free_suffix_zero_cost() {
+        // Models with `:free` suffix should report zero cost (#463)
+        let (input, output) = model_cost("stepfun/step-3.5-flash:free").unwrap();
+        assert_eq!(input, Decimal::ZERO);
+        assert_eq!(output, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_openrouter_free_router_zero_cost() {
+        // The "openrouter/free" router model should report zero cost (#463)
+        let (input, output) = model_cost("openrouter/free").unwrap();
+        assert_eq!(input, Decimal::ZERO);
+        assert_eq!(output, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_bare_free_zero_cost() {
+        // Edge case: bare "free" after prefix stripping
+        let (input, output) = model_cost("free").unwrap();
+        assert_eq!(input, Decimal::ZERO);
+        assert_eq!(output, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_free_suffix_various_providers() {
+        // Various provider-prefixed free models
+        for model in &[
+            "google/gemma-3-27b-it:free",
+            "meta-llama/llama-4-maverick:free",
+            "microsoft/phi-4:free",
+            "nousresearch/deephermes-3-llama-3-8b-preview:free",
+        ] {
+            let (input, output) =
+                model_cost(model).unwrap_or_else(|| panic!("{model} should return Some"));
+            assert_eq!(input, Decimal::ZERO, "{model} input cost should be zero");
+            assert_eq!(output, Decimal::ZERO, "{model} output cost should be zero");
+        }
     }
 }

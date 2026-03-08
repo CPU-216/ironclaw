@@ -29,12 +29,14 @@ use crate::workspace::search::RankedResult;
 ///
 /// That's it — no Database wrapper, no delegation boilerplate.
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait VectorStore: Send + Sync {
     /// Store an embedding for a chunk.
     async fn store_embedding(
         &self,
         chunk_id: Uuid,
         document_id: Uuid,
+        document_path: &str,
         user_id: &str,
         agent_id: Option<Uuid>,
         content: &str,
@@ -46,6 +48,7 @@ pub trait VectorStore: Send + Sync {
         &self,
         chunk_id: Uuid,
         document_id: Uuid,
+        document_path: &str,
         user_id: &str,
         agent_id: Option<Uuid>,
         content: &str,

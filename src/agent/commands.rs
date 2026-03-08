@@ -12,8 +12,20 @@ use crate::agent::session::Session;
 use crate::agent::submission::SubmissionResult;
 use crate::agent::{Agent, MessageIntent};
 use crate::channels::{IncomingMessage, StatusUpdate};
+use crate::context::JobState;
 use crate::error::Error;
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, Reasoning};
+
+/// Format a count with a suffix, using K/M abbreviations for large numbers.
+fn format_count(n: u64, suffix: &str) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M {}", n as f64 / 1_000_000.0, suffix)
+    } else if n >= 1_000 {
+        format!("{:.1}K {}", n as f64 / 1_000.0, suffix)
+    } else {
+        format!("{} {}", n, suffix)
+    }
+}
 
 impl Agent {
     /// Handle job-related intents without turn tracking.
@@ -56,7 +68,10 @@ impl Agent {
                 self.handle_help_job(&message.user_id, &job_id).await?
             }
             MessageIntent::Command { command, args } => {
-                match self.handle_command(&command, &args).await? {
+                match self
+                    .handle_command(&command, &args, &message.channel)
+                    .await?
+                {
                     Some(s) => s,
                     None => return Ok(SubmissionResult::Ok { message: None }), // Shutdown signal
                 }
@@ -73,35 +88,22 @@ impl Agent {
         description: String,
         category: Option<String>,
     ) -> Result<String, Error> {
-        // Create job context
         let job_id = self
-            .context_manager
-            .create_job_for_user(user_id, &title, &description)
+            .scheduler
+            .dispatch_job(user_id, &title, &description, None)
             .await?;
 
-        // Update category if provided
-        if let Some(cat) = category {
-            self.context_manager
+        // Set the dedicated category field (not stored in metadata)
+        if let Some(cat) = category
+            && let Err(e) = self
+                .context_manager
                 .update_context(job_id, |ctx| {
                     ctx.category = Some(cat);
                 })
-                .await?;
-        }
-
-        // Persist new job to database (fire-and-forget)
-        if let Some(store) = self.store()
-            && let Ok(ctx) = self.context_manager.get_context(job_id).await
+                .await
         {
-            let store = store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = store.save_job(&ctx).await {
-                    tracing::warn!("Failed to persist new job {}: {}", job_id, e);
-                }
-            });
+            tracing::warn!(job_id = %job_id, "Failed to set job category: {}", e);
         }
-
-        // Schedule for execution
-        self.scheduler.schedule(job_id).await?;
 
         Ok(format!(
             "Created job: {}\nID: {}\n\nThe job has been scheduled and is now running.",
@@ -118,6 +120,22 @@ impl Agent {
             Some(id) => {
                 let uuid = Uuid::parse_str(&id)
                     .map_err(|_| crate::error::JobError::NotFound { id: Uuid::nil() })?;
+
+                // Try DB first for persistent state, fall back to ContextManager.
+                if let Some(store) = self.store()
+                    && let Ok(Some(ctx)) = store.get_job(uuid).await
+                {
+                    return Ok(format!(
+                        "Job: {}\nStatus: {:?}\nCreated: {}\nStarted: {}\nActual cost: {}",
+                        ctx.title,
+                        ctx.state,
+                        ctx.created_at.format("%Y-%m-%d %H:%M:%S"),
+                        ctx.started_at
+                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_else(|| "Not started".to_string()),
+                        ctx.actual_cost
+                    ));
+                }
 
                 let ctx = self.context_manager.get_context(uuid).await?;
                 if ctx.user_id != user_id {
@@ -136,10 +154,38 @@ impl Agent {
                 ))
             }
             None => {
-                // Show summary of all jobs
+                // Show summary from DB for consistency with Jobs tab.
+                if let Some(store) = self.store() {
+                    let mut total = 0;
+                    let mut in_progress = 0;
+                    let mut completed = 0;
+                    let mut failed = 0;
+                    let mut stuck = 0;
+
+                    if let Ok(s) = store.agent_job_summary().await {
+                        total += s.total;
+                        in_progress += s.in_progress;
+                        completed += s.completed;
+                        failed += s.failed;
+                        stuck += s.stuck;
+                    }
+                    if let Ok(s) = store.sandbox_job_summary().await {
+                        total += s.total;
+                        in_progress += s.running;
+                        completed += s.completed;
+                        failed += s.failed + s.interrupted;
+                    }
+
+                    return Ok(format!(
+                        "Jobs summary: Total: {} In Progress: {} Completed: {} Failed: {} Stuck: {}",
+                        total, in_progress, completed, failed, stuck
+                    ));
+                }
+
+                // Fallback to ContextManager if no DB.
                 let summary = self.context_manager.summary_for(user_id).await;
                 Ok(format!(
-                    "Jobs summary:\n  Total: {}\n  In Progress: {}\n  Completed: {}\n  Failed: {}\n  Stuck: {}",
+                    "Jobs summary: Total: {} In Progress: {} Completed: {} Failed: {} Stuck: {}",
                     summary.total,
                     summary.in_progress,
                     summary.completed,
@@ -161,6 +207,15 @@ impl Agent {
 
         self.scheduler.stop(uuid).await?;
 
+        // Also update DB so the Jobs tab reflects cancellation immediately.
+        if let Some(store) = self.store()
+            && let Err(e) = store
+                .update_job_status(uuid, JobState::Cancelled, Some("Cancelled by user"))
+                .await
+        {
+            tracing::warn!(job_id = %uuid, "Failed to persist cancellation to DB: {}", e);
+        }
+
         Ok(format!("Job {} has been cancelled.", job_id))
     }
 
@@ -169,21 +224,49 @@ impl Agent {
         user_id: &str,
         _filter: Option<String>,
     ) -> Result<String, Error> {
-        let jobs = self.context_manager.all_jobs_for(user_id).await;
+        // List from DB for consistency with Jobs tab.
+        if let Some(store) = self.store() {
+            let agent_jobs = match store.list_agent_jobs().await {
+                Ok(jobs) => jobs,
+                Err(e) => {
+                    tracing::warn!("Failed to list agent jobs: {}", e);
+                    Vec::new()
+                }
+            };
+            let sandbox_jobs = match store.list_sandbox_jobs().await {
+                Ok(jobs) => jobs,
+                Err(e) => {
+                    tracing::warn!("Failed to list sandbox jobs: {}", e);
+                    Vec::new()
+                }
+            };
 
+            if agent_jobs.is_empty() && sandbox_jobs.is_empty() {
+                return Ok("No jobs found.".to_string());
+            }
+
+            let mut output = String::from("Jobs:\n");
+            for j in &agent_jobs {
+                output.push_str(&format!("  {} - {} ({})\n", j.id, j.title, j.status));
+            }
+            for j in &sandbox_jobs {
+                output.push_str(&format!("  {} - {} ({})\n", j.id, j.task, j.status));
+            }
+            return Ok(output);
+        }
+
+        // Fallback to ContextManager if no DB.
+        let jobs = self.context_manager.all_jobs_for(user_id).await;
         if jobs.is_empty() {
             return Ok("No jobs found.".to_string());
         }
 
         let mut output = String::from("Jobs:\n");
         for job_id in jobs {
-            if let Ok(ctx) = self.context_manager.get_context(job_id).await
-                && ctx.user_id == user_id
-            {
+            if let Ok(ctx) = self.context_manager.get_context(job_id).await {
                 output.push_str(&format!("  {} - {} ({:?})\n", job_id, ctx.title, ctx.state));
             }
         }
-
         Ok(output)
     }
 
@@ -222,6 +305,33 @@ impl Agent {
         }
     }
 
+    /// Show job status inline — either all jobs (no id) or a specific job.
+    pub(super) async fn process_job_status(
+        &self,
+        user_id: &str,
+        job_id: Option<&str>,
+    ) -> Result<SubmissionResult, Error> {
+        match self
+            .handle_check_status(user_id, job_id.map(|s| s.to_string()))
+            .await
+        {
+            Ok(text) => Ok(SubmissionResult::response(text)),
+            Err(e) => Ok(SubmissionResult::error(format!("Job status error: {}", e))),
+        }
+    }
+
+    /// Cancel a job by ID.
+    pub(super) async fn process_job_cancel(
+        &self,
+        user_id: &str,
+        job_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        match self.handle_cancel_job(user_id, job_id).await {
+            Ok(text) => Ok(SubmissionResult::response(text)),
+            Err(e) => Ok(SubmissionResult::error(format!("Cancel error: {}", e))),
+        }
+    }
+
     /// Trigger a manual heartbeat check.
     pub(super) async fn process_heartbeat(&self) -> Result<SubmissionResult, Error> {
         let Some(workspace) = self.workspace() else {
@@ -232,6 +342,7 @@ impl Agent {
 
         let runner = crate::agent::HeartbeatRunner::new(
             crate::agent::HeartbeatConfig::default(),
+            crate::workspace::hygiene::HygieneConfig::default(),
             workspace.clone(),
             self.llm().clone(),
         );
@@ -294,10 +405,11 @@ impl Agent {
             .with_max_tokens(512)
             .with_temperature(0.3);
 
-        match self.llm().complete(request).await {
-            Ok(response) => Ok(SubmissionResult::response(format!(
+        let reasoning = Reasoning::new(self.llm().clone());
+        match reasoning.complete(request).await {
+            Ok((text, _usage)) => Ok(SubmissionResult::response(format!(
                 "Thread Summary:\n\n{}",
-                response.content.trim()
+                text.trim()
             ))),
             Err(e) => Ok(SubmissionResult::error(format!("Summarize failed: {}", e))),
         }
@@ -341,10 +453,11 @@ impl Agent {
             .with_max_tokens(512)
             .with_temperature(0.5);
 
-        match self.llm().complete(request).await {
-            Ok(response) => Ok(SubmissionResult::response(format!(
+        let reasoning = Reasoning::new(self.llm().clone());
+        match reasoning.complete(request).await {
+            Ok((text, _usage)) => Ok(SubmissionResult::response(format!(
                 "Suggested Next Steps:\n\n{}",
-                response.content.trim()
+                text.trim()
             ))),
             Err(e) => Ok(SubmissionResult::error(format!("Suggest failed: {}", e))),
         }
@@ -355,6 +468,7 @@ impl Agent {
         &self,
         command: &str,
         args: &[String],
+        channel: &str,
     ) -> Result<SubmissionResult, Error> {
         match command {
             "help" => Ok(SubmissionResult::response(concat!(
@@ -382,15 +496,82 @@ impl Agent {
                 "  /thread <id>      Switch to thread\n",
                 "  /resume <id>      Resume from checkpoint\n",
                 "\n",
+                "Skills:\n",
+                "  /skills             List installed skills\n",
+                "  /skills search <q>  Search ClawHub registry\n",
+                "\n",
                 "Agent:\n",
                 "  /heartbeat        Run heartbeat check\n",
                 "  /summarize        Summarize current thread\n",
                 "  /suggest          Suggest next steps\n",
+                "  /restart          Gracefully restart the process\n",
                 "\n",
                 "  /quit             Exit",
             ))),
 
             "ping" => Ok(SubmissionResult::response("pong!")),
+
+            "restart" => {
+                tracing::info!("[commands::restart] Restart command received");
+                // Channel authorization check: restart is only available via web interface
+                if channel != "gateway" {
+                    tracing::warn!(
+                        "[commands::restart] Restart rejected: not from gateway channel (from: {})",
+                        channel
+                    );
+                    return Ok(SubmissionResult::error(
+                        "Restart is only available through the web interface with explicit user confirmation. \
+                         Use the Restart button in the UI."
+                            .to_string(),
+                    ));
+                }
+                // Environment check: restart is only available in Docker containers
+                let in_docker = std::env::var("IRONCLAW_IN_DOCKER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false);
+
+                tracing::debug!("[commands::restart] IRONCLAW_IN_DOCKER={}", in_docker);
+
+                if !in_docker {
+                    tracing::warn!(
+                        "[commands::restart] Restart rejected: not in Docker environment"
+                    );
+                    return Ok(SubmissionResult::error(
+                        "Restart is not available in this environment. \
+                         The IRONCLAW_IN_DOCKER environment variable must be set to 'true' for Docker deployments."
+                            .to_string(),
+                    ));
+                }
+
+                // Execute restart tool directly (don't dispatch as a job for LLM planning)
+                // This ensures the tool runs immediately without LLM involvement
+                use crate::tools::Tool;
+                let tool = crate::tools::builtin::RestartTool;
+                let params = serde_json::json!({});
+
+                // Create a minimal JobContext for the tool
+                let dummy_ctx =
+                    crate::context::JobContext::with_user("system", "Restart", "Graceful restart");
+
+                match tool.execute(params, &dummy_ctx).await {
+                    Ok(output) => {
+                        tracing::info!("[commands::restart] RestartTool executed successfully");
+                        // Extract text from the ToolOutput result
+                        let response = match output.result {
+                            serde_json::Value::String(s) => s,
+                            _ => output.result.to_string(),
+                        };
+                        Ok(SubmissionResult::response(response))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[commands::restart] RestartTool execution failed: {:?}",
+                            e
+                        );
+                        Ok(SubmissionResult::error(format!("Restart failed: {}", e)))
+                    }
+                }
+            }
 
             "version" => Ok(SubmissionResult::response(format!(
                 "{} v{}",
@@ -412,6 +593,22 @@ impl Agent {
                 Ok(SubmissionResult::ok_with_message(
                     "Debug toggle is handled by your client.",
                 ))
+            }
+
+            "skills" => {
+                if args.first().map(|s| s.as_str()) == Some("search") {
+                    let query = args[1..].join(" ");
+                    if query.is_empty() {
+                        return Ok(SubmissionResult::error("Usage: /skills search <query>"));
+                    }
+                    self.handle_skills_search(&query).await
+                } else if args.is_empty() {
+                    self.handle_skills_list().await
+                } else {
+                    Ok(SubmissionResult::error(
+                        "Usage: /skills or /skills search <query>",
+                    ))
+                }
             }
 
             "model" => {
@@ -465,10 +662,14 @@ impl Agent {
                     }
 
                     match self.llm().set_model(requested) {
-                        Ok(()) => Ok(SubmissionResult::response(format!(
-                            "Switched model to: {}",
-                            requested
-                        ))),
+                        Ok(()) => {
+                            // Persist the model choice so it survives restarts.
+                            self.persist_selected_model(requested).await;
+                            Ok(SubmissionResult::response(format!(
+                                "Switched model to: {}",
+                                requested
+                            )))
+                        }
                         Err(e) => Ok(SubmissionResult::error(format!(
                             "Failed to switch model: {}",
                             e
@@ -484,20 +685,182 @@ impl Agent {
         }
     }
 
+    /// List installed skills.
+    async fn handle_skills_list(&self) -> Result<SubmissionResult, Error> {
+        let Some(registry) = self.skill_registry() else {
+            return Ok(SubmissionResult::error("Skills system not enabled."));
+        };
+
+        let guard = match registry.read() {
+            Ok(g) => g,
+            Err(e) => {
+                return Ok(SubmissionResult::error(format!(
+                    "Skill registry lock error: {}",
+                    e
+                )));
+            }
+        };
+
+        let skills = guard.skills();
+        if skills.is_empty() {
+            return Ok(SubmissionResult::response(
+                "No skills installed.\n\nUse /skills search <query> to find skills on ClawHub.",
+            ));
+        }
+
+        let mut out = String::from("Installed skills:\n\n");
+        for s in skills {
+            let desc = if s.manifest.description.chars().count() > 60 {
+                let truncated: String = s.manifest.description.chars().take(57).collect();
+                format!("{}...", truncated)
+            } else {
+                s.manifest.description.clone()
+            };
+            out.push_str(&format!(
+                "  {:<24} v{:<10} [{}]  {}\n",
+                s.manifest.name, s.manifest.version, s.trust, desc,
+            ));
+        }
+        out.push_str("\nUse /skills search <query> to find more on ClawHub.");
+
+        Ok(SubmissionResult::response(out))
+    }
+
+    /// Search ClawHub for skills.
+    async fn handle_skills_search(&self, query: &str) -> Result<SubmissionResult, Error> {
+        let catalog = match self.skill_catalog() {
+            Some(c) => c,
+            None => {
+                return Ok(SubmissionResult::error("Skill catalog not available."));
+            }
+        };
+
+        let outcome = catalog.search(query).await;
+
+        // Enrich top results with detail data (stars, downloads, owner)
+        let mut entries = outcome.results;
+        catalog.enrich_search_results(&mut entries, 5).await;
+
+        let mut out = format!("ClawHub results for \"{}\":\n\n", query);
+
+        if entries.is_empty() {
+            if let Some(ref err) = outcome.error {
+                out.push_str(&format!("  (registry error: {})\n", err));
+            } else {
+                out.push_str("  No results found.\n");
+            }
+        } else {
+            for entry in &entries {
+                let owner_str = entry
+                    .owner
+                    .as_deref()
+                    .map(|o| format!("  by {}", o))
+                    .unwrap_or_default();
+
+                let stats_parts: Vec<String> = [
+                    entry.stars.map(|s| format!("{} stars", s)),
+                    entry.downloads.map(|d| format_count(d, "downloads")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let stats_str = if stats_parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", stats_parts.join("  "))
+                };
+
+                out.push_str(&format!(
+                    "  {:<24} v{:<10}{}{}\n",
+                    entry.name, entry.version, owner_str, stats_str,
+                ));
+                if !entry.description.is_empty() {
+                    out.push_str(&format!("    {}\n\n", entry.description));
+                }
+            }
+        }
+
+        // Show matching installed skills
+        if let Some(registry) = self.skill_registry()
+            && let Ok(guard) = registry.read()
+        {
+            let query_lower = query.to_lowercase();
+            let matches: Vec<_> = guard
+                .skills()
+                .iter()
+                .filter(|s| {
+                    s.manifest.name.to_lowercase().contains(&query_lower)
+                        || s.manifest.description.to_lowercase().contains(&query_lower)
+                })
+                .collect();
+
+            if !matches.is_empty() {
+                out.push_str(&format!("Installed skills matching \"{}\":\n", query));
+                for s in &matches {
+                    out.push_str(&format!(
+                        "  {:<24} v{:<10} [{}]\n",
+                        s.manifest.name, s.manifest.version, s.trust,
+                    ));
+                }
+            }
+        }
+
+        Ok(SubmissionResult::response(out))
+    }
+
     /// Handle legacy command routing from the Router (job commands that go through
     /// process_user_input -> router -> handle_job_or_command -> here).
     pub(super) async fn handle_command(
         &self,
         command: &str,
         args: &[String],
+        channel: &str,
     ) -> Result<Option<String>, Error> {
         // System commands are now handled directly via Submission::SystemCommand,
         // but the router may still send us unknown /commands.
-        match self.handle_system_command(command, args).await? {
+        match self.handle_system_command(command, args, channel).await? {
             SubmissionResult::Response { content } => Ok(Some(content)),
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             _ => Ok(None),
+        }
+    }
+
+    /// Persist the selected model to the settings store (DB and/or TOML config).
+    ///
+    /// Best-effort: logs warnings on failure but does not propagate errors,
+    /// since the in-memory model switch already succeeded.
+    async fn persist_selected_model(&self, model: &str) {
+        // 1. Persist to DB if available.
+        if let Some(store) = self.store() {
+            let value = serde_json::Value::String(model.to_string());
+            if let Err(e) = store.set_setting("default", "selected_model", &value).await {
+                tracing::warn!("Failed to persist model to DB: {}", e);
+            }
+        }
+
+        // 2. Update TOML config file if it exists (sync I/O in spawn_blocking).
+        let model_owned = model.to_string();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            let toml_path = crate::settings::Settings::default_toml_path();
+            match crate::settings::Settings::load_toml(&toml_path) {
+                Ok(Some(mut settings)) => {
+                    settings.selected_model = Some(model_owned);
+                    if let Err(e) = settings.save_toml(&toml_path) {
+                        tracing::warn!("Failed to persist model to config.toml: {}", e);
+                    }
+                }
+                Ok(None) => {
+                    // No config file on disk; nothing to update.
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load config.toml for model persistence: {}", e);
+                }
+            }
+        })
+        .await
+        {
+            tracing::warn!("Model TOML persistence task failed: {}", e);
         }
     }
 }

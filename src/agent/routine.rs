@@ -26,6 +26,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::RoutineError;
+
 /// A routine is a named, persistent, user-owned task with a trigger and an action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Routine {
@@ -55,7 +57,11 @@ pub struct Routine {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Trigger {
     /// Fire on a cron schedule (e.g. "0 9 * * MON-FRI" or "every 2h").
-    Cron { schedule: String },
+    Cron {
+        schedule: String,
+        #[serde(default)]
+        timezone: Option<String>,
+    },
     /// Fire when a channel message matches a pattern.
     Event {
         /// Optional channel filter (e.g. "telegram", "slack").
@@ -86,21 +92,41 @@ impl Trigger {
     }
 
     /// Parse a trigger from its DB representation.
-    pub fn from_db(trigger_type: &str, config: serde_json::Value) -> Result<Self, String> {
+    pub fn from_db(trigger_type: &str, config: serde_json::Value) -> Result<Self, RoutineError> {
         match trigger_type {
             "cron" => {
                 let schedule = config
                     .get("schedule")
                     .and_then(|v| v.as_str())
-                    .ok_or("cron trigger missing 'schedule'")?
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "cron trigger".into(),
+                        field: "schedule".into(),
+                    })?
                     .to_string();
-                Ok(Trigger::Cron { schedule })
+                let timezone = config
+                    .get("timezone")
+                    .and_then(|v| v.as_str())
+                    .and_then(|tz| {
+                        if crate::timezone::parse_timezone(tz).is_some() {
+                            Some(tz.to_string())
+                        } else {
+                            tracing::warn!(
+                                "Ignoring invalid timezone '{}' from DB for cron trigger",
+                                tz
+                            );
+                            None
+                        }
+                    });
+                Ok(Trigger::Cron { schedule, timezone })
             }
             "event" => {
                 let pattern = config
                     .get("pattern")
                     .and_then(|v| v.as_str())
-                    .ok_or("event trigger missing 'pattern'")?
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "event trigger".into(),
+                        field: "pattern".into(),
+                    })?
                     .to_string();
                 let channel = config
                     .get("channel")
@@ -120,14 +146,19 @@ impl Trigger {
                 Ok(Trigger::Webhook { path, secret })
             }
             "manual" => Ok(Trigger::Manual),
-            other => Err(format!("unknown trigger type: {other}")),
+            other => Err(RoutineError::UnknownTriggerType {
+                trigger_type: other.to_string(),
+            }),
         }
     }
 
     /// Serialize trigger-specific config to JSON for DB storage.
     pub fn to_config_json(&self) -> serde_json::Value {
         match self {
-            Trigger::Cron { schedule } => serde_json::json!({ "schedule": schedule }),
+            Trigger::Cron { schedule, timezone } => serde_json::json!({
+                "schedule": schedule,
+                "timezone": timezone,
+            }),
             Trigger::Event { channel, pattern } => serde_json::json!({
                 "pattern": pattern,
                 "channel": channel,
@@ -165,6 +196,11 @@ pub enum RoutineAction {
         /// Max reasoning iterations (default: 10).
         #[serde(default = "default_max_iterations")]
         max_iterations: u32,
+        /// Tool names pre-authorized for `Always`-approval tools (e.g. destructive
+        /// shell commands, cross-channel messaging). `UnlessAutoApproved` tools are
+        /// automatically permitted in routine jobs without listing them here.
+        #[serde(default)]
+        tool_permissions: Vec<String>,
     },
 }
 
@@ -174,6 +210,19 @@ fn default_max_tokens() -> u32 {
 
 fn default_max_iterations() -> u32 {
     10
+}
+
+/// Parse a `tool_permissions` JSON array into a `Vec<String>`.
+pub fn parse_tool_permissions(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("tool_permissions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl RoutineAction {
@@ -186,13 +235,16 @@ impl RoutineAction {
     }
 
     /// Parse an action from its DB representation.
-    pub fn from_db(action_type: &str, config: serde_json::Value) -> Result<Self, String> {
+    pub fn from_db(action_type: &str, config: serde_json::Value) -> Result<Self, RoutineError> {
         match action_type {
             "lightweight" => {
                 let prompt = config
                     .get("prompt")
                     .and_then(|v| v.as_str())
-                    .ok_or("lightweight action missing 'prompt'")?
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "lightweight action".into(),
+                        field: "prompt".into(),
+                    })?
                     .to_string();
                 let context_paths = config
                     .get("context_paths")
@@ -217,25 +269,35 @@ impl RoutineAction {
                 let title = config
                     .get("title")
                     .and_then(|v| v.as_str())
-                    .ok_or("full_job action missing 'title'")?
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "full_job action".into(),
+                        field: "title".into(),
+                    })?
                     .to_string();
                 let description = config
                     .get("description")
                     .and_then(|v| v.as_str())
-                    .ok_or("full_job action missing 'description'")?
+                    .ok_or_else(|| RoutineError::MissingField {
+                        context: "full_job action".into(),
+                        field: "description".into(),
+                    })?
                     .to_string();
                 let max_iterations = config
                     .get("max_iterations")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(default_max_iterations() as u64)
                     as u32;
+                let tool_permissions = parse_tool_permissions(&config);
                 Ok(RoutineAction::FullJob {
                     title,
                     description,
                     max_iterations,
+                    tool_permissions,
                 })
             }
-            other => Err(format!("unknown action type: {other}")),
+            other => Err(RoutineError::UnknownActionType {
+                action_type: other.to_string(),
+            }),
         }
     }
 
@@ -255,10 +317,12 @@ impl RoutineAction {
                 title,
                 description,
                 max_iterations,
+                tool_permissions,
             } => serde_json::json!({
                 "title": title,
                 "description": description,
                 "max_iterations": max_iterations,
+                "tool_permissions": tool_permissions,
             }),
         }
     }
@@ -334,14 +398,16 @@ impl std::fmt::Display for RunStatus {
 }
 
 impl FromStr for RunStatus {
-    type Err = String;
+    type Err = RoutineError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "running" => Ok(RunStatus::Running),
             "ok" => Ok(RunStatus::Ok),
             "attention" => Ok(RunStatus::Attention),
             "failed" => Ok(RunStatus::Failed),
-            other => Err(format!("unknown run status: {other}")),
+            other => Err(RoutineError::UnknownRunStatus {
+                status: other.to_string(),
+            }),
         }
     }
 }
@@ -370,10 +436,25 @@ pub fn content_hash(content: &str) -> u64 {
 }
 
 /// Parse a cron expression and compute the next fire time from now.
-pub fn next_cron_fire(schedule: &str) -> Result<Option<DateTime<Utc>>, String> {
+///
+/// When `timezone` is provided and valid, the schedule is evaluated in that
+/// timezone and the result is converted back to UTC. Otherwise UTC is used.
+pub fn next_cron_fire(
+    schedule: &str,
+    timezone: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, RoutineError> {
     let cron_schedule =
-        cron::Schedule::from_str(schedule).map_err(|e| format!("invalid cron: {e}"))?;
-    Ok(cron_schedule.upcoming(Utc).next())
+        cron::Schedule::from_str(schedule).map_err(|e| RoutineError::InvalidCron {
+            reason: e.to_string(),
+        })?;
+    if let Some(tz) = timezone.and_then(crate::timezone::parse_timezone) {
+        Ok(cron_schedule
+            .upcoming(tz)
+            .next()
+            .map(|dt| dt.with_timezone(&Utc)))
+    } else {
+        Ok(cron_schedule.upcoming(Utc).next())
+    }
 }
 
 #[cfg(test)]
@@ -386,10 +467,11 @@ mod tests {
     fn test_trigger_roundtrip() {
         let trigger = Trigger::Cron {
             schedule: "0 9 * * MON-FRI".to_string(),
+            timezone: None,
         };
         let json = trigger.to_config_json();
         let parsed = Trigger::from_db("cron", json).expect("parse cron");
-        assert!(matches!(parsed, Trigger::Cron { schedule } if schedule == "0 9 * * MON-FRI"));
+        assert!(matches!(parsed, Trigger::Cron { schedule, .. } if schedule == "0 9 * * MON-FRI"));
     }
 
     #[test]
@@ -425,12 +507,13 @@ mod tests {
             title: "Deploy review".to_string(),
             description: "Review and deploy pending changes".to_string(),
             max_iterations: 5,
+            tool_permissions: vec!["shell".to_string()],
         };
         let json = action.to_config_json();
         let parsed = RoutineAction::from_db("full_job", json).expect("parse full_job");
         assert!(
-            matches!(parsed, RoutineAction::FullJob { title, max_iterations, .. }
-            if title == "Deploy review" && max_iterations == 5)
+            matches!(parsed, RoutineAction::FullJob { title, max_iterations, tool_permissions, .. }
+            if title == "Deploy review" && max_iterations == 5 && tool_permissions == vec!["shell".to_string()])
         );
     }
 
@@ -461,14 +544,56 @@ mod tests {
     #[test]
     fn test_next_cron_fire_valid() {
         // Every minute should always have a next fire
-        let next = next_cron_fire("* * * * * *").expect("valid cron");
+        let next = next_cron_fire("* * * * * *", None).expect("valid cron");
         assert!(next.is_some());
     }
 
     #[test]
     fn test_next_cron_fire_invalid() {
-        let result = next_cron_fire("not a cron");
+        let result = next_cron_fire("not a cron", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trigger_cron_timezone_roundtrip() {
+        let trigger = Trigger::Cron {
+            schedule: "0 9 * * MON-FRI".to_string(),
+            timezone: Some("America/New_York".to_string()),
+        };
+        let json = trigger.to_config_json();
+        let parsed = Trigger::from_db("cron", json).expect("parse cron");
+        assert!(matches!(parsed, Trigger::Cron { schedule, timezone }
+                if schedule == "0 9 * * MON-FRI"
+                && timezone.as_deref() == Some("America/New_York")));
+    }
+
+    #[test]
+    fn test_trigger_cron_no_timezone_backward_compat() {
+        let json = serde_json::json!({"schedule": "0 9 * * *"});
+        let parsed = Trigger::from_db("cron", json).expect("parse cron");
+        assert!(matches!(parsed, Trigger::Cron { timezone, .. } if timezone.is_none()));
+    }
+
+    #[test]
+    fn test_trigger_cron_invalid_timezone_coerced_to_none() {
+        let json = serde_json::json!({"schedule": "0 9 * * *", "timezone": "Fake/Zone"});
+        let parsed = Trigger::from_db("cron", json).expect("parse cron");
+        assert!(
+            matches!(parsed, Trigger::Cron { timezone, .. } if timezone.is_none()),
+            "invalid timezone should be coerced to None"
+        );
+    }
+
+    #[test]
+    fn test_next_cron_fire_with_timezone() {
+        let next_utc = next_cron_fire("0 0 9 * * * *", None)
+            .expect("valid cron")
+            .expect("has next");
+        let next_est = next_cron_fire("0 0 9 * * * *", Some("America/New_York"))
+            .expect("valid cron")
+            .expect("has next");
+        // EST is UTC-5 (or EDT UTC-4), so the UTC result should differ
+        assert_ne!(next_utc, next_est, "timezone should shift the fire time");
     }
 
     #[test]
@@ -483,7 +608,8 @@ mod tests {
     fn test_trigger_type_tag() {
         assert_eq!(
             Trigger::Cron {
-                schedule: String::new()
+                schedule: String::new(),
+                timezone: None,
             }
             .type_tag(),
             "cron"

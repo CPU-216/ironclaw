@@ -100,6 +100,7 @@ mod impl_lancedb {
             Schema::new(vec![
                 Field::new("chunk_id", DataType::Utf8, false),
                 Field::new("document_id", DataType::Utf8, false),
+                Field::new("document_path", DataType::Utf8, false),
                 Field::new("user_id", DataType::Utf8, false),
                 Field::new("agent_id", DataType::Utf8, true),
                 Field::new("content", DataType::Utf8, false),
@@ -121,6 +122,7 @@ mod impl_lancedb {
             &self,
             chunk_id: Uuid,
             document_id: Uuid,
+            document_path: &str,
             user_id: &str,
             agent_id: Option<Uuid>,
             content: &str,
@@ -147,6 +149,7 @@ mod impl_lancedb {
 
             let chunk_ids = StringArray::from(vec![chunk_id.to_string()]);
             let document_ids = StringArray::from(vec![document_id.to_string()]);
+            let document_paths = StringArray::from(vec![document_path]);
             let user_ids = StringArray::from(vec![user_id]);
             let agent_ids = StringArray::from(vec![agent_id.map(|a| a.to_string())]);
             let contents = StringArray::from(vec![content]);
@@ -161,6 +164,7 @@ mod impl_lancedb {
                 vec![
                     Arc::new(chunk_ids),
                     Arc::new(document_ids),
+                    Arc::new(document_paths),
                     Arc::new(user_ids),
                     Arc::new(agent_ids),
                     Arc::new(contents),
@@ -189,6 +193,7 @@ mod impl_lancedb {
             &self,
             chunk_id: Uuid,
             document_id: Uuid,
+            document_path: &str,
             user_id: &str,
             agent_id: Option<Uuid>,
             content: &str,
@@ -213,8 +218,16 @@ mod impl_lancedb {
                     reason: format!("Failed to delete chunk for update: {}", e),
                 })?;
 
-            self.store_embedding(chunk_id, document_id, user_id, agent_id, content, embedding)
-                .await
+            self.store_embedding(
+                chunk_id,
+                document_id,
+                document_path,
+                user_id,
+                agent_id,
+                content,
+                embedding,
+            )
+            .await
         }
 
         async fn delete_embeddings(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
@@ -301,6 +314,11 @@ mod impl_lancedb {
                         reason: "document_id column missing".to_string(),
                     }
                 })?;
+                let document_path_col = batch.column_by_name("document_path").ok_or_else(|| {
+                    WorkspaceError::SearchFailed {
+                        reason: "document_path column missing".to_string(),
+                    }
+                })?;
                 let content_col = batch.column_by_name("content").ok_or_else(|| {
                     WorkspaceError::SearchFailed {
                         reason: "content column missing".to_string(),
@@ -318,6 +336,12 @@ mod impl_lancedb {
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| WorkspaceError::SearchFailed {
                         reason: "document_id wrong type".to_string(),
+                    })?;
+                let document_paths = document_path_col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| WorkspaceError::SearchFailed {
+                        reason: "document_path wrong type".to_string(),
                     })?;
                 let contents = content_col
                     .as_any()
@@ -344,11 +368,13 @@ mod impl_lancedb {
                             ),
                         }
                     })?;
+                    let document_path = document_paths.value(i).to_string();
                     let content = contents.value(i).to_string();
 
                     results.push(RankedResult {
                         chunk_id,
                         document_id,
+                        document_path,
                         content,
                         rank,
                     });
@@ -390,7 +416,15 @@ mod tests {
         let embedding = make_embedding(1.0);
 
         store
-            .store_embedding(chunk_id, document_id, user_id, None, content, &embedding)
+            .store_embedding(
+                chunk_id,
+                document_id,
+                "test.md",
+                user_id,
+                None,
+                content,
+                &embedding,
+            )
             .await
             .unwrap();
 
@@ -419,6 +453,7 @@ mod tests {
                 .store_embedding(
                     Uuid::new_v4(),
                     doc_id,
+                    "test.md",
                     user_id,
                     None,
                     &format!("content {}", i),
@@ -453,6 +488,7 @@ mod tests {
             .store_embedding(
                 Uuid::new_v4(),
                 doc_id,
+                "test.md",
                 user_id,
                 None,
                 "content",
@@ -490,6 +526,7 @@ mod tests {
             .store_embedding(
                 chunk_id,
                 doc_id,
+                "test.md",
                 user_id,
                 None,
                 content,
@@ -500,7 +537,15 @@ mod tests {
 
         let new_embedding = make_embedding(5.0);
         store
-            .update_embedding(chunk_id, doc_id, user_id, None, content, &new_embedding)
+            .update_embedding(
+                chunk_id,
+                doc_id,
+                "test.md",
+                user_id,
+                None,
+                content,
+                &new_embedding,
+            )
             .await
             .unwrap();
 
@@ -524,6 +569,7 @@ mod tests {
             .store_embedding(
                 Uuid::new_v4(),
                 doc_id,
+                "test.md",
                 "user1",
                 None,
                 "user1 content",
@@ -536,6 +582,7 @@ mod tests {
             .store_embedding(
                 Uuid::new_v4(),
                 doc_id,
+                "test.md",
                 "user2",
                 None,
                 "user2 content",
@@ -576,6 +623,7 @@ mod tests {
             .store_embedding(
                 Uuid::new_v4(),
                 Uuid::new_v4(),
+                "test.md",
                 "user1",
                 None,
                 "content",

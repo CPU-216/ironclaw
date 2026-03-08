@@ -15,6 +15,7 @@
 //! - `/compact` - Compact the context
 //! - `/new` - Start a new thread
 //! - `yes`/`no`/`always` - Respond to tool approval prompts
+//! - `Esc` - Interrupt current operation
 
 use std::borrow::Cow;
 use std::io::{self, Write};
@@ -28,12 +29,16 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
-use rustyline::{CompletionType, Editor, Helper};
+use rustyline::{
+    Cmd as ReadlineCmd, CompletionType, ConditionalEventHandler, Editor, Event, EventContext,
+    EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
+};
 use termimad::MadSkin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::truncate_for_preview;
+use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
 
@@ -120,6 +125,23 @@ impl Highlighter for ReplHelper {
 
 impl Validator for ReplHelper {}
 impl Helper for ReplHelper {}
+
+struct EscInterruptHandler {
+    triggered: Arc<AtomicBool>,
+}
+
+impl ConditionalEventHandler for EscInterruptHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext,
+    ) -> Option<ReadlineCmd> {
+        self.triggered.store(true, Ordering::Relaxed);
+        Some(ReadlineCmd::Interrupt)
+    }
+}
 
 /// Build a termimad skin with our color scheme.
 fn make_skin() -> MadSkin {
@@ -247,6 +269,7 @@ fn print_help() {
     println!("  {c}/compact{r}           {d}compact context window{r}");
     println!("  {c}/new{r}               {d}new conversation thread{r}");
     println!("  {c}/interrupt{r}         {d}stop current operation{r}");
+    println!("  {c}esc{r}                {d}stop current operation{r}");
     println!();
     println!("  {h}Approval responses{r}");
     println!("  {c}yes{r} ({c}y{r})            {d}approve tool execution{r}");
@@ -257,10 +280,7 @@ fn print_help() {
 
 /// Get the history file path (~/.ironclaw/history).
 fn history_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw")
-        .join("history")
+    ironclaw_base_dir().join("history")
 }
 
 #[async_trait]
@@ -274,11 +294,14 @@ impl Channel for ReplChannel {
         let single_message = self.single_message.clone();
         let debug_mode = Arc::clone(&self.debug_mode);
         let suppress_banner = Arc::clone(&self.suppress_banner);
+        let esc_interrupt_triggered_for_thread = Arc::new(AtomicBool::new(false));
 
         std::thread::spawn(move || {
+            let sys_tz = crate::timezone::detect_system_timezone().name().to_string();
+
             // Single message mode: send it and return
             if let Some(msg) = single_message {
-                let incoming = IncomingMessage::new("repl", "default", &msg);
+                let incoming = IncomingMessage::new("repl", "default", &msg).with_timezone(&sys_tz);
                 let _ = tx.blocking_send(incoming);
                 return;
             }
@@ -300,6 +323,13 @@ impl Channel for ReplChannel {
             };
 
             rl.set_helper(Some(ReplHelper));
+
+            rl.bind_sequence(
+                KeyEvent(KeyCode::Esc, Modifiers::NONE),
+                EventHandler::Conditional(Box::new(EscInterruptHandler {
+                    triggered: Arc::clone(&esc_interrupt_triggered_for_thread),
+                })),
+            );
 
             // Load history
             let hist_path = history_path();
@@ -330,7 +360,14 @@ impl Channel for ReplChannel {
                         // Handle local REPL commands (only commands that need
                         // immediate local handling stay here)
                         match line.to_lowercase().as_str() {
-                            "/quit" | "/exit" => break,
+                            "/quit" | "/exit" => {
+                                // Forward shutdown command so the agent loop exits even
+                                // when other channels (e.g. web gateway) are still active.
+                                let msg = IncomingMessage::new("repl", "default", "/quit")
+                                    .with_timezone(&sys_tz);
+                                let _ = tx.blocking_send(msg);
+                                break;
+                            }
                             "/help" => {
                                 print_help();
                                 continue;
@@ -348,21 +385,32 @@ impl Channel for ReplChannel {
                             _ => {}
                         }
 
-                        let msg = IncomingMessage::new("repl", "default", line);
+                        let msg =
+                            IncomingMessage::new("repl", "default", line).with_timezone(&sys_tz);
                         if tx.blocking_send(msg).is_err() {
                             break;
                         }
                     }
                     Err(ReadlineError::Interrupted) => {
-                        // Ctrl+C: send /interrupt
-                        let msg = IncomingMessage::new("repl", "default", "/interrupt");
-                        if tx.blocking_send(msg).is_err() {
+                        if esc_interrupt_triggered_for_thread.swap(false, Ordering::Relaxed) {
+                            // Esc: interrupt current operation and keep REPL open.
+                            let msg = IncomingMessage::new("repl", "default", "/interrupt")
+                                .with_timezone(&sys_tz);
+                            if tx.blocking_send(msg).is_err() {
+                                break;
+                            }
+                        } else {
+                            // Ctrl+C (VINTR): request graceful shutdown.
+                            let msg = IncomingMessage::new("repl", "default", "/quit")
+                                .with_timezone(&sys_tz);
+                            let _ = tx.blocking_send(msg);
                             break;
                         }
                     }
                     Err(ReadlineError::Eof) => {
                         // Ctrl+D: send /quit so the agent loop runs graceful shutdown
-                        let msg = IncomingMessage::new("repl", "default", "/quit");
+                        let msg =
+                            IncomingMessage::new("repl", "default", "/quit").with_timezone(&sys_tz);
                         let _ = tx.blocking_send(msg);
                         break;
                     }
@@ -425,7 +473,7 @@ impl Channel for ReplChannel {
             StatusUpdate::ToolStarted { name } => {
                 eprintln!("  \x1b[33m\u{25CB} {name}\x1b[0m");
             }
-            StatusUpdate::ToolCompleted { name, success } => {
+            StatusUpdate::ToolCompleted { name, success, .. } => {
                 if success {
                     eprintln!("  \x1b[32m\u{25CF} {name}\x1b[0m");
                 } else {

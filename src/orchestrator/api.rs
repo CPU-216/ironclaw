@@ -143,6 +143,7 @@ async fn llm_complete(
 ) -> Result<Json<ProxyCompletionResponse>, StatusCode> {
     let completion_req = CompletionRequest {
         messages: req.messages,
+        model: req.model,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         stop_sequences: req.stop_sequences,
@@ -159,6 +160,8 @@ async fn llm_complete(
         input_tokens: resp.input_tokens,
         output_tokens: resp.output_tokens,
         finish_reason: format_finish_reason(resp.finish_reason),
+        cache_read_input_tokens: resp.cache_read_input_tokens,
+        cache_creation_input_tokens: resp.cache_creation_input_tokens,
     }))
 }
 
@@ -170,6 +173,7 @@ async fn llm_complete_with_tools(
     let tool_req = ToolCompletionRequest {
         messages: req.messages,
         tools: req.tools,
+        model: req.model,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         tool_choice: req.tool_choice,
@@ -187,6 +191,8 @@ async fn llm_complete_with_tools(
         input_tokens: resp.input_tokens,
         output_tokens: resp.output_tokens,
         finish_reason: format_finish_reason(resp.finish_reason),
+        cache_read_input_tokens: resp.cache_read_input_tokens,
+        cache_creation_input_tokens: resp.cache_creation_input_tokens,
     }))
 }
 
@@ -449,48 +455,17 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use crate::error::LlmError;
-    use crate::llm::{
-        CompletionRequest, CompletionResponse, ToolCompletionRequest, ToolCompletionResponse,
-    };
     use crate::orchestrator::auth::TokenStore;
     use crate::orchestrator::job_manager::{ContainerJobConfig, ContainerJobManager};
+    use crate::testing::StubLlm;
 
     use super::*;
-
-    /// Stub LLM provider that panics if called (tests only exercise routing/auth).
-    struct StubLlm;
-
-    #[async_trait::async_trait]
-    impl crate::llm::LlmProvider for StubLlm {
-        fn model_name(&self) -> &str {
-            "stub"
-        }
-        fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
-            (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
-        }
-        async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-            Err(LlmError::RequestFailed {
-                provider: "stub".into(),
-                reason: "not implemented".into(),
-            })
-        }
-        async fn complete_with_tools(
-            &self,
-            _req: ToolCompletionRequest,
-        ) -> Result<ToolCompletionResponse, LlmError> {
-            Err(LlmError::RequestFailed {
-                provider: "stub".into(),
-                reason: "not implemented".into(),
-            })
-        }
-    }
 
     fn test_state() -> OrchestratorState {
         let token_store = TokenStore::new();
         let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
         OrchestratorState {
-            llm: Arc::new(StubLlm),
+            llm: Arc::new(StubLlm::default()),
             job_manager: Arc::new(jm),
             token_store,
             job_event_tx: None,
@@ -722,7 +697,7 @@ mod tests {
             .await;
 
         let state = OrchestratorState {
-            llm: Arc::new(StubLlm),
+            llm: Arc::new(StubLlm::default()),
             job_manager: Arc::new(jm),
             token_store,
             job_event_tx: None,
@@ -757,7 +732,7 @@ mod tests {
         let token_store = TokenStore::new();
         let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
         let state = OrchestratorState {
-            llm: Arc::new(StubLlm),
+            llm: Arc::new(StubLlm::default()),
             job_manager: Arc::new(jm),
             token_store: token_store.clone(),
             job_event_tx: Some(tx),
@@ -812,7 +787,7 @@ mod tests {
         let token_store = TokenStore::new();
         let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
         let state = OrchestratorState {
-            llm: Arc::new(StubLlm),
+            llm: Arc::new(StubLlm::default()),
             job_manager: Arc::new(jm),
             token_store: token_store.clone(),
             job_event_tx: Some(tx),
@@ -860,7 +835,7 @@ mod tests {
         let token_store = TokenStore::new();
         let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
         let state = OrchestratorState {
-            llm: Arc::new(StubLlm),
+            llm: Arc::new(StubLlm::default()),
             job_manager: Arc::new(jm),
             token_store: token_store.clone(),
             job_event_tx: Some(tx),

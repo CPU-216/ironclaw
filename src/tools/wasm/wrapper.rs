@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::Linker;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::context::JobContext;
@@ -581,17 +581,32 @@ impl WasmToolWrapper {
         // Set up resource limiter
         store.limiter(|data| &mut data.limiter);
 
-        // Compile the component (uses cached bytes)
-        let component = Component::new(engine, self.prepared.component_bytes())
-            .map_err(|e| WasmError::CompilationFailed(e.to_string()))?;
+        // Use the pre-compiled component (no recompilation needed)
+        let component = self.prepared.component().clone();
 
         // Create linker with all host functions properly namespaced
         let mut linker = Linker::new(engine);
         Self::add_host_functions(&mut linker)?;
 
         // Instantiate using the generated bindings
-        let instance = SandboxedTool::instantiate(&mut store, &component, &linker)
-            .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
+        let instance =
+            SandboxedTool::instantiate(&mut store, &component, &linker).map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("near:agent") || msg.contains("import") {
+                    WasmError::InstantiationFailed(format!(
+                        "{msg}. This usually means the extension was compiled against \
+                         a different WIT version than the host supports. \
+                         Rebuild the extension against the current WIT (host: {}).",
+                        crate::tools::wasm::WIT_TOOL_VERSION
+                    ))
+                } else {
+                    WasmError::InstantiationFailed(msg)
+                }
+            })?;
+
+        // Coerce string-encoded values to their schema-declared types.
+        // LLMs frequently pass numeric values as strings (e.g. "5" instead of 5).
+        let params = coerce_params_to_schema(params, &self.schema);
 
         // Prepare the request
         let params_json = serde_json::to_string(&params)
@@ -653,10 +668,17 @@ impl Tool for WasmToolWrapper {
         // Pre-resolve host credentials from secrets store (async, before blocking task).
         // This decrypts the secrets once so the sync http_request() host function
         // can inject them without needing async access.
+        //
+        // BUG FIX: ExtensionManager stores OAuth tokens under user_id "default"
+        // (hardcoded at construction in app.rs), but this was previously looking
+        // them up under ctx.user_id — which could be a Telegram user ID, web
+        // gateway user, etc. — causing credential resolution to silently fail.
+        // Must match the storage key until per-user credential isolation is added.
+        let credential_user_id = "default";
         let host_credentials = resolve_host_credentials(
             &self.capabilities,
             self.secrets_store.as_deref(),
-            &ctx.user_id,
+            credential_user_id,
             self.oauth_refresh.as_ref(),
         )
         .await;
@@ -992,51 +1014,36 @@ async fn resolve_host_credentials(
 /// Also handles IPv6 bracket notation like `http://[::1]:8080/path`.
 /// Returns None for malformed URLs.
 fn extract_host_from_url(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host_port = &after_scheme[..end];
-    // Strip userinfo (user:pass@host)
-    let after_userinfo = host_port
-        .rfind('@')
-        .map(|i| &host_port[i + 1..])
-        .unwrap_or(host_port);
-    // Handle IPv6 bracket notation: [::1]:port -> ::1
-    if after_userinfo.starts_with('[') {
-        let closing = after_userinfo.find(']')?;
-        return Some(after_userinfo[1..closing].to_string());
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
     }
-    // Regular host:port -> host
-    let host = after_userinfo
-        .rfind(':')
-        .map(|i| &after_userinfo[..i])
-        .unwrap_or(after_userinfo);
-    Some(host.to_string())
+    parsed.host_str().map(|h| {
+        h.strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .unwrap_or(h)
+            .to_lowercase()
+    })
 }
 
 /// Resolve the URL's hostname and reject connections to private/internal IP addresses.
 /// This prevents DNS rebinding attacks where an attacker's domain resolves to an
 /// internal IP after passing the allowlist check.
 fn reject_private_ip(url: &str) -> Result<(), String> {
-    let host = url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| {
-            let host_and_port = rest.split('/').next().unwrap_or(rest);
-            // Strip port
-            if host_and_port.starts_with('[') {
-                // IPv6
-                host_and_port.find(']').map(|i| &host_and_port[1..i])
-            } else {
-                Some(
-                    host_and_port
-                        .rfind(':')
-                        .map_or(host_and_port, |i| &host_and_port[..i]),
-                )
-            }
+    let parsed = url::Url::parse(url).map_err(|e| format!("Failed to parse URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("Unsupported URL scheme: {}", parsed.scheme()));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL contains userinfo (@) which is not allowed".to_string());
+    }
+
+    let host = parsed
+        .host_str()
+        .map(|h| {
+            h.strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap_or(h)
         })
         .ok_or_else(|| "Failed to parse host from URL".to_string())?;
 
@@ -1097,6 +1104,61 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             || (v6.segments()[0] & 0xFFC0) == 0xFE80
         }
     }
+}
+
+/// Coerce parameter values to match their JSON Schema-declared types.
+///
+/// LLMs frequently send numeric values as strings (e.g. `"5"` instead of `5`)
+/// or booleans as strings (`"true"` instead of `true`). This walks the params
+/// object and converts string values where the schema expects a different type.
+fn coerce_params_to_schema(
+    mut params: serde_json::Value,
+    schema: &serde_json::Value,
+) -> serde_json::Value {
+    let properties = schema.get("properties").and_then(|p| p.as_object());
+
+    let properties = match properties {
+        Some(p) => p,
+        None => return params,
+    };
+
+    let obj = match params.as_object_mut() {
+        Some(o) => o,
+        None => return params,
+    };
+
+    for (key, prop_schema) in properties {
+        let declared_type = prop_schema.get("type").and_then(|t| t.as_str());
+        let declared_type = match declared_type {
+            Some(t) => t,
+            None => continue,
+        };
+
+        if let Some(current_value) = obj.get_mut(key)
+            && let Some(s) = current_value.as_str()
+        {
+            if declared_type == "string" {
+                continue;
+            }
+
+            let coerced = match declared_type {
+                "number" => s.parse::<f64>().ok().map(serde_json::Value::from),
+                "integer" => s.parse::<i64>().ok().map(serde_json::Value::from),
+                "boolean" => match s.to_lowercase().as_str() {
+                    "true" => Some(serde_json::json!(true)),
+                    "false" => Some(serde_json::json!(false)),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            if let Some(new_val) = coerced {
+                *current_value = new_val;
+            }
+        }
+    }
+
+    params
 }
 
 #[cfg(test)]
@@ -1603,5 +1665,84 @@ mod tests {
         // 8.8.8.8 (Google DNS) is public
         let result = super::reject_private_ip("https://8.8.8.8/dns-query");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_coerce_params_string_to_number() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "number" },
+                "name": { "type": "string" }
+            }
+        });
+        let params = serde_json::json!({"count": "5", "name": "test"});
+        let result = super::coerce_params_to_schema(params, &schema);
+        assert_eq!(result["count"], serde_json::json!(5.0));
+        assert_eq!(result["name"], serde_json::json!("test"));
+    }
+
+    #[test]
+    fn test_coerce_params_string_to_integer() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer" }
+            }
+        });
+        let params = serde_json::json!({"limit": "10"});
+        let result = super::coerce_params_to_schema(params, &schema);
+        assert_eq!(result["limit"], serde_json::json!(10));
+    }
+
+    #[test]
+    fn test_coerce_params_string_to_boolean() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "boolean" },
+                "b": { "type": "boolean" },
+                "c": { "type": "boolean" },
+                "d": { "type": "boolean" }
+            }
+        });
+        let params = serde_json::json!({
+            "a": "true",
+            "b": "false",
+            "c": "True",
+            "d": "FALSE"
+        });
+        let result = super::coerce_params_to_schema(params, &schema);
+        assert_eq!(result["a"], serde_json::json!(true));
+        assert_eq!(result["b"], serde_json::json!(false));
+        assert_eq!(result["c"], serde_json::json!(true));
+        assert_eq!(result["d"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_coerce_params_already_correct_type() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "number" }
+            }
+        });
+        let params = serde_json::json!({"count": 5});
+        let result = super::coerce_params_to_schema(params, &schema);
+        assert_eq!(result["count"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn test_coerce_params_invalid_string_not_coerced() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "number" }
+            }
+        });
+        let params = serde_json::json!({"count": "not-a-number"});
+        let result = super::coerce_params_to_schema(params, &schema);
+        // Should remain as string since it can't be parsed
+        assert_eq!(result["count"], serde_json::json!("not-a-number"));
     }
 }

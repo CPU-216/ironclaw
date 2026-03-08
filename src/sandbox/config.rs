@@ -28,13 +28,13 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // Disabled by default until Docker is confirmed available
+            enabled: true, // Startup check disables gracefully if Docker unavailable
             policy: SandboxPolicy::ReadOnly,
             timeout: Duration::from_secs(120),
             memory_limit_mb: 2048,
             cpu_shares: 1024,
             network_allowlist: default_allowlist(),
-            image: "ghcr.io/nearai/sandbox:latest".to_string(),
+            image: "ironclaw-worker:latest".to_string(),
             auto_pull_image: true,
             proxy_port: 0,
         }

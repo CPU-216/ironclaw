@@ -48,6 +48,9 @@ pub enum Error {
 
     #[error("Worker error: {0}")]
     Worker(#[from] WorkerError),
+
+    #[error("Routine error: {0}")]
+    Routine(#[from] RoutineError),
 }
 
 /// Configuration-related errors.
@@ -199,6 +202,12 @@ pub enum ToolError {
     #[error("Tool {name} requires authentication")]
     AuthRequired { name: String },
 
+    #[error("Tool {name} is rate limited, retry after {retry_after:?}")]
+    RateLimited {
+        name: String,
+        retry_after: Option<Duration>,
+    },
+
     #[error("Tool builder failed: {0}")]
     BuilderFailed(String),
 }
@@ -322,6 +331,9 @@ pub enum WorkspaceError {
 
     #[error("Heartbeat error: {reason}")]
     HeartbeatError { reason: String },
+
+    #[error("I/O error: {reason}")]
+    IoError { reason: String },
 }
 
 /// Orchestrator errors (internal API, container management).
@@ -365,5 +377,195 @@ pub enum WorkerError {
     MissingToken,
 }
 
+/// Routine-related errors.
+#[derive(Debug, thiserror::Error)]
+pub enum RoutineError {
+    #[error("Unknown trigger type: {trigger_type}")]
+    UnknownTriggerType { trigger_type: String },
+
+    #[error("Unknown action type: {action_type}")]
+    UnknownActionType { action_type: String },
+
+    #[error("Missing field in {context}: {field}")]
+    MissingField { context: String, field: String },
+
+    #[error("Invalid cron expression: {reason}")]
+    InvalidCron { reason: String },
+
+    #[error("Unknown run status: {status}")]
+    UnknownRunStatus { status: String },
+
+    #[error("Routine {name} is disabled")]
+    Disabled { name: String },
+
+    #[error("Routine not found: {id}")]
+    NotFound { id: Uuid },
+
+    #[error("Not authorized to trigger routine {id}")]
+    NotAuthorized { id: Uuid },
+
+    #[error("Routine {name} at max concurrent runs")]
+    MaxConcurrent { name: String },
+
+    #[error("Database error: {reason}")]
+    Database { reason: String },
+
+    #[error("LLM call failed: {reason}")]
+    LlmFailed { reason: String },
+
+    #[error("Failed to dispatch full job: {reason}")]
+    JobDispatchFailed { reason: String },
+
+    #[error("LLM returned empty content")]
+    EmptyResponse,
+
+    #[error("LLM response truncated (finish_reason=length) with no content")]
+    TruncatedResponse,
+}
+
 /// Result type alias for the agent.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_error_display() {
+        let err = ConfigError::MissingEnvVar("DATABASE_URL".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DATABASE_URL"),
+            "Should mention the variable name: {msg}"
+        );
+
+        let err = ConfigError::MissingRequired {
+            key: "llm.model".to_string(),
+            hint: "Set LLM_MODEL env var".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("llm.model"), "Should mention the key: {msg}");
+        assert!(
+            msg.contains("Set LLM_MODEL"),
+            "Should include the hint: {msg}"
+        );
+
+        let err = ConfigError::InvalidValue {
+            key: "port".to_string(),
+            message: "must be a number".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("port"), "Should mention the key: {msg}");
+    }
+
+    #[test]
+    fn database_error_display() {
+        let err = DatabaseError::NotFound {
+            entity: "conversation".to_string(),
+            id: "abc-123".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("conversation"), "Should mention entity: {msg}");
+        assert!(msg.contains("abc-123"), "Should mention id: {msg}");
+
+        let err = DatabaseError::Query("syntax error near SELECT".to_string());
+        assert!(err.to_string().contains("syntax error"));
+    }
+
+    #[test]
+    fn channel_error_display() {
+        let err = ChannelError::StartupFailed {
+            name: "telegram".to_string(),
+            reason: "invalid token".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("telegram"), "Should mention channel: {msg}");
+        assert!(
+            msg.contains("invalid token"),
+            "Should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn llm_error_display() {
+        let err = LlmError::ContextLengthExceeded {
+            used: 100_000,
+            limit: 50_000,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("100000"), "Should mention used tokens: {msg}");
+        assert!(msg.contains("50000"), "Should mention limit: {msg}");
+
+        let err = LlmError::RateLimited {
+            provider: "openai".to_string(),
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("openai"), "Should mention provider: {msg}");
+    }
+
+    #[test]
+    fn job_error_display() {
+        let err = JobError::MaxJobsExceeded { max: 5 };
+        let msg = err.to_string();
+        assert!(msg.contains("5"), "Should mention max: {msg}");
+
+        let id = Uuid::new_v4();
+        let err = JobError::NotFound { id };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&id.to_string()),
+            "Should mention job id: {msg}"
+        );
+    }
+
+    #[test]
+    fn safety_error_display() {
+        let err = SafetyError::InjectionDetected {
+            pattern: "SYSTEM:".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("SYSTEM:"), "Should mention pattern: {msg}");
+    }
+
+    #[test]
+    fn workspace_error_display() {
+        let err = WorkspaceError::DocumentNotFound {
+            doc_type: "notes".to_string(),
+            user_id: "user1".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("notes"), "Should mention doc_type: {msg}");
+        assert!(msg.contains("user1"), "Should mention user_id: {msg}");
+    }
+
+    #[test]
+    fn routine_error_display() {
+        let err = RoutineError::InvalidCron {
+            reason: "bad format".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("bad format"), "Should mention reason: {msg}");
+    }
+
+    #[test]
+    fn top_level_error_from_conversions() {
+        let config_err = ConfigError::MissingEnvVar("TEST".to_string());
+        let err: Error = config_err.into();
+        assert!(matches!(err, Error::Config(_)));
+
+        let db_err = DatabaseError::Query("test".to_string());
+        let err: Error = db_err.into();
+        assert!(matches!(err, Error::Database(_)));
+
+        let job_err = JobError::MaxJobsExceeded { max: 1 };
+        let err: Error = job_err.into();
+        assert!(matches!(err, Error::Job(_)));
+
+        let safety_err = SafetyError::ValidationFailed {
+            reason: "test".to_string(),
+        };
+        let err: Error = safety_err.into();
+        assert!(matches!(err, Error::Safety(_)));
+    }
+}

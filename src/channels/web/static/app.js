@@ -5,14 +5,49 @@ let eventSource = null;
 let logEventSource = null;
 let currentTab = 'chat';
 let currentThreadId = null;
+let currentThreadIsReadOnly = false;
 let assistantThreadId = null;
 let hasMore = false;
 let oldestTimestamp = null;
 let loadingOlder = false;
+let sseHasConnectedBefore = false;
 let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
+let pairingPollInterval = null;
+let unreadThreads = new Map(); // thread_id -> unread count
+let _loadThreadsTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
+
+// --- Slash Commands ---
+
+const SLASH_COMMANDS = [
+  { cmd: '/status',     desc: 'Show all jobs, or /status <id> for one job' },
+  { cmd: '/list',       desc: 'List all jobs' },
+  { cmd: '/cancel',     desc: '/cancel <job-id> — cancel a running job' },
+  { cmd: '/undo',       desc: 'Revert the last turn' },
+  { cmd: '/redo',       desc: 'Re-apply an undone turn' },
+  { cmd: '/compact',    desc: 'Compress the context window' },
+  { cmd: '/clear',      desc: 'Clear thread and start fresh' },
+  { cmd: '/interrupt',  desc: 'Stop the current turn' },
+  { cmd: '/heartbeat',  desc: 'Trigger manual heartbeat check' },
+  { cmd: '/summarize',  desc: 'Summarize the current thread' },
+  { cmd: '/suggest',    desc: 'Suggest next steps' },
+  { cmd: '/help',       desc: 'Show help' },
+  { cmd: '/version',    desc: 'Show version info' },
+  { cmd: '/tools',      desc: 'List available tools' },
+  { cmd: '/skills',     desc: 'List installed skills' },
+  { cmd: '/model',      desc: 'Show or switch the LLM model' },
+  { cmd: '/thread new', desc: 'Create a new conversation thread' },
+];
+
+let _slashSelected = -1;
+let _slashMatches = [];
+
+// --- Tool Activity State ---
+let _activeGroup = null;
+let _activeToolCards = {};
+let _activityThinking = null;
 
 // --- Auth ---
 
@@ -29,16 +64,25 @@ function authenticate() {
       sessionStorage.setItem('ironclaw_token', token);
       document.getElementById('auth-screen').style.display = 'none';
       document.getElementById('app').style.display = 'flex';
-      // Strip token from URL so it's not visible in the address bar
+      // Strip token and log_level from URL so they're not visible in the address bar
       const cleaned = new URL(window.location);
+      const urlLogLevel = cleaned.searchParams.get('log_level');
       cleaned.searchParams.delete('token');
+      cleaned.searchParams.delete('log_level');
       window.history.replaceState({}, '', cleaned.pathname + cleaned.search);
       connectSSE();
       connectLogSSE();
       startGatewayStatusPolling();
+      checkTeeStatus();
       loadThreads();
       loadMemoryTree();
       loadJobs();
+      // Apply URL log_level param if present, otherwise just sync the dropdown
+      if (urlLogLevel) {
+        setServerLogLevel(urlLogLevel);
+      } else {
+        loadServerLogLevel();
+      }
     })
     .catch(() => {
       sessionStorage.removeItem('ironclaw_token');
@@ -83,9 +127,118 @@ function apiFetch(path, options) {
     opts.body = JSON.stringify(opts.body);
   }
   return fetch(path, opts).then((res) => {
-    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    if (!res.ok) {
+      return res.text().then(function(body) {
+        throw new Error(body || (res.status + ' ' + res.statusText));
+      });
+    }
     return res.json();
   });
+}
+
+// --- Restart Feature ---
+
+let isRestarting = false; // Track if we're currently restarting
+let restartEnabled = false; // Track if restart is available in this deployment
+
+function triggerRestart() {
+  if (!currentThreadId) {
+    alert('Please start a conversation first');
+    return;
+  }
+
+  // Show the confirmation modal
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'flex';
+}
+
+function confirmRestart() {
+  if (!currentThreadId) {
+    alert('Please start a conversation first');
+    return;
+  }
+
+  // Hide confirmation modal
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'none';
+
+  const restartBtn = document.getElementById('restart-btn');
+  const restartIcon = document.getElementById('restart-icon');
+
+  // Mark as restarting
+  isRestarting = true;
+  restartBtn.disabled = true;
+  if (restartIcon) restartIcon.classList.add('spinning');
+
+  // Show progress modal
+  const loaderEl = document.getElementById('restart-loader');
+  loaderEl.style.display = 'flex';
+
+  // Send restart command via chat
+  console.log('[confirmRestart] Sending /restart command to server');
+  apiFetch('/api/chat/send', {
+    method: 'POST',
+    body: {
+      content: '/restart',
+      thread_id: currentThreadId,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    },
+  })
+    .then((response) => {
+      console.log('[confirmRestart] API call succeeded, response:', response);
+    })
+    .catch((err) => {
+      console.error('[confirmRestart] Restart request failed:', err);
+      addMessage('system', 'Restart failed: ' + err.message);
+      isRestarting = false;
+      restartBtn.disabled = false;
+      if (restartIcon) restartIcon.classList.remove('spinning');
+      loaderEl.style.display = 'none';
+    });
+}
+
+function cancelRestart() {
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'none';
+}
+
+function tryShowRestartModal() {
+  // Defensive callback for when restart is detected in messages.
+  if (!isRestarting) {
+    isRestarting = true;
+    const restartBtn = document.getElementById('restart-btn');
+    const restartIcon = document.getElementById('restart-icon');
+    restartBtn.disabled = true;
+    if (restartIcon) restartIcon.classList.add('spinning');
+
+    // Show progress modal
+    const loaderEl = document.getElementById('restart-loader');
+    loaderEl.style.display = 'flex';
+  }
+}
+
+function updateRestartButtonVisibility() {
+  const restartBtn = document.getElementById('restart-btn');
+  if (restartBtn) {
+    restartBtn.style.display = restartEnabled ? 'block' : 'none';
+  }
+}
+
+function startGatewayStatusPolling() {
+  fetchGatewayStatus();
+  // Poll every 5 seconds
+  setInterval(fetchGatewayStatus, 5000);
+}
+
+function fetchGatewayStatus() {
+  apiFetch('/api/gateway/status')
+    .then((data) => {
+      restartEnabled = data.restart_enabled || false;
+      updateRestartButtonVisibility();
+    })
+    .catch((err) => {
+      console.warn('[gateway status] Failed to fetch:', err);
+    });
 }
 
 // --- SSE ---
@@ -98,6 +251,23 @@ function connectSSE() {
   eventSource.onopen = () => {
     document.getElementById('sse-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = 'Connected';
+
+    // If we were restarting, close the modal and reset button now that server is back
+    if (isRestarting) {
+      const loaderEl = document.getElementById('restart-loader');
+      if (loaderEl) loaderEl.style.display = 'none';
+      const restartBtn = document.getElementById('restart-btn');
+      const restartIcon = document.getElementById('restart-icon');
+      if (restartBtn) restartBtn.disabled = false;
+      if (restartIcon) restartIcon.classList.remove('spinning');
+      isRestarting = false;
+    }
+
+    if (sseHasConnectedBefore && currentThreadId) {
+      finalizeActivityGroup();
+      loadHistory();
+    }
+    sseHasConnectedBefore = true;
   };
 
   eventSource.onerror = () => {
@@ -107,47 +277,76 @@ function connectSSE() {
 
   eventSource.addEventListener('response', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) {
+        unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+        debouncedLoadThreads();
+      }
+      return;
+    }
+    finalizeActivityGroup();
     addMessage('assistant', data.content);
-    setStatus('');
     enableChatInput();
     // Refresh thread list so new titles appear after first message
     loadThreads();
+
+    // Show restart modal if the response indicates restart was initiated
+    if (data.content && data.content.toLowerCase().includes('restart initiated')) {
+      setTimeout(() => tryShowRestartModal(), 500);
+    }
   });
 
   eventSource.addEventListener('thinking', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
-    setStatus(data.message, true);
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) debouncedLoadThreads();
+      return;
+    }
+    showActivityThinking(data.message);
   });
 
   eventSource.addEventListener('tool_started', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    setStatus('Running tool: ' + data.name, true);
+    addToolCard(data.name);
   });
 
   eventSource.addEventListener('tool_completed', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    const icon = data.success ? '\u2713' : '\u2717';
-    setStatus('Tool ' + data.name + ' ' + icon);
+    completeToolCard(data.name, data.success, data.error, data.parameters);
+
+    // Show restart modal only when the restart tool succeeds
+    if (data.name.toLowerCase() === 'restart' && data.success) {
+      setTimeout(() => tryShowRestartModal(), 500);
+    }
+  });
+
+  eventSource.addEventListener('tool_result', (e) => {
+    const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
+    setToolCardOutput(data.name, data.preview);
   });
 
   eventSource.addEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
+    finalizeActivityGroup();
     appendToLastAssistant(data.content);
   });
 
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
-    setStatus(data.message);
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) debouncedLoadThreads();
+      return;
+    }
     // "Done" and "Awaiting approval" are terminal signals from the agent:
     // the agentic loop finished, so re-enable input as a safety net in case
     // the response SSE event is empty or lost.
+    // Status text is not displayed — inline activity cards handle visual feedback.
     if (data.message === 'Done' || data.message === 'Awaiting approval') {
+      finalizeActivityGroup();
       enableChatInput();
     }
   });
@@ -159,25 +358,42 @@ function connectSSE() {
 
   eventSource.addEventListener('approval_needed', (e) => {
     const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
     showApproval(data);
   });
 
   eventSource.addEventListener('auth_required', (e) => {
     const data = JSON.parse(e.data);
-    showAuthCard(data);
+    if (data.auth_url) {
+      // OAuth flow: show the auth card with an OAuth button + optional token paste field.
+      showAuthCard(data);
+    } else {
+      // Setup flow: fetch the extension's credential schema and show the multi-field
+      // configure modal (the same UI used by the Extensions tab "Setup" button).
+      showConfigureModal(data.extension_name);
+    }
   });
 
   eventSource.addEventListener('auth_completed', (e) => {
     const data = JSON.parse(e.data);
+    // Dismiss whichever UI path was active: auth card (OAuth) or configure modal (setup).
     removeAuthCard(data.extension_name);
-    showToast(data.message, 'success');
+    closeConfigureModal();
+    showToast(data.message, data.success ? 'success' : 'error');
+    // Refresh extensions list so status indicators update
+    if (currentTab === 'extensions') loadExtensions();
     enableChatInput();
+  });
+
+  eventSource.addEventListener('extension_status', (e) => {
+    if (currentTab === 'extensions') loadExtensions();
   });
 
   eventSource.addEventListener('error', (e) => {
     if (e.data) {
       const data = JSON.parse(e.data);
       if (!isCurrentThread(data.thread_id)) return;
+      finalizeActivityGroup();
       addMessage('system', 'Error: ' + data.message);
       enableChatInput();
     }
@@ -214,9 +430,9 @@ function connectSSE() {
 }
 
 // Check if an SSE event belongs to the currently viewed thread.
-// Events without a thread_id (legacy) are always shown.
+// Events without a thread_id are dropped (prevents notification leaking).
 function isCurrentThread(threadId) {
-  if (!threadId) return true;
+  if (!threadId) return false;
   if (!currentThreadId) return true;
   return threadId === currentThreadId;
 }
@@ -225,34 +441,99 @@ function isCurrentThread(threadId) {
 
 function sendMessage() {
   const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('send-btn');
+  if (!currentThreadId) {
+    console.warn('sendMessage: no thread selected, ignoring');
+    return;
+  }
   const content = input.value.trim();
   if (!content) return;
 
   addMessage('user', content);
   input.value = '';
   autoResizeTextarea(input);
-  setStatus('Sending...', true);
-
-  sendBtn.disabled = true;
-  input.disabled = true;
+  input.focus();
 
   apiFetch('/api/chat/send', {
     method: 'POST',
-    body: { content, thread_id: currentThreadId || undefined },
+    body: { content, thread_id: currentThreadId || undefined, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
   }).catch((err) => {
     addMessage('system', 'Failed to send: ' + err.message);
-    setStatus('');
-    enableChatInput();
   });
 }
 
 function enableChatInput() {
+  if (currentThreadIsReadOnly) return;
   const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('send-btn');
-  sendBtn.disabled = false;
-  input.disabled = false;
+  const btn = document.getElementById('send-btn');
+  if (input) {
+    input.disabled = false;
+    input.placeholder = 'Message or / for commands...';
+  }
+  if (btn) btn.disabled = false;
+}
+
+// --- Slash Autocomplete ---
+
+function showSlashAutocomplete(matches) {
+  const el = document.getElementById('slash-autocomplete');
+  if (!el || matches.length === 0) { hideSlashAutocomplete(); return; }
+  _slashMatches = matches;
+  _slashSelected = -1;
+  el.innerHTML = '';
+  matches.forEach((item, i) => {
+    const row = document.createElement('div');
+    row.className = 'slash-ac-item';
+    row.dataset.index = i;
+    var cmdSpan = document.createElement('span');
+    cmdSpan.className = 'slash-ac-cmd';
+    cmdSpan.textContent = item.cmd;
+    var descSpan = document.createElement('span');
+    descSpan.className = 'slash-ac-desc';
+    descSpan.textContent = item.desc;
+    row.appendChild(cmdSpan);
+    row.appendChild(descSpan);
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // prevent blur
+      selectSlashItem(item.cmd);
+    });
+    el.appendChild(row);
+  });
+  el.style.display = 'block';
+}
+
+function hideSlashAutocomplete() {
+  const el = document.getElementById('slash-autocomplete');
+  if (el) el.style.display = 'none';
+  _slashSelected = -1;
+  _slashMatches = [];
+}
+
+function selectSlashItem(cmd) {
+  const input = document.getElementById('chat-input');
+  input.value = cmd + ' ';
   input.focus();
+  hideSlashAutocomplete();
+  autoResizeTextarea(input);
+}
+
+function updateSlashHighlight() {
+  const items = document.querySelectorAll('#slash-autocomplete .slash-ac-item');
+  items.forEach((el, i) => el.classList.toggle('selected', i === _slashSelected));
+  if (_slashSelected >= 0 && items[_slashSelected]) {
+    items[_slashSelected].scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function filterSlashCommands(value) {
+  if (!value.startsWith('/')) { hideSlashAutocomplete(); return; }
+  // Only show autocomplete when the input is just a slash command prefix (no spaces except /thread new)
+  const lower = value.toLowerCase();
+  const matches = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(lower));
+  if (matches.length === 0 || (matches.length === 1 && matches[0].cmd === lower.trimEnd())) {
+    hideSlashAutocomplete();
+  } else {
+    showSlashAutocomplete(matches);
+  }
 }
 
 function sendApprovalAction(requestId, action) {
@@ -276,11 +557,20 @@ function sendApprovalAction(requestId, action) {
     const labelText = action === 'approve' ? 'Approved' : action === 'always' ? 'Always approved' : 'Denied';
     label.textContent = labelText;
     actions.appendChild(label);
+    // Remove the card after showing the confirmation briefly
+    setTimeout(() => { card.remove(); }, 1500);
   }
 }
 
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined') {
+    // Escape raw HTML error pages instead of rendering them as markup.
+    // Only triggers when the text *starts with* a doctype or <html> tag
+    // (after optional whitespace), so normal messages that mention HTML
+    // tags in prose or code fences are not affected.  See #263.
+    if (/^\s*<!doctype\s/i.test(text) || /^\s*<html[\s>]/i.test(text)) {
+      return escapeHtml(text);
+    }
     let html = marked.parse(text);
     // Sanitize HTML output to prevent XSS from tool output or LLM responses.
     html = sanitizeRenderedHtml(html);
@@ -351,13 +641,251 @@ function appendToLastAssistant(chunk) {
   }
 }
 
-function setStatus(text, spinning) {
-  const el = document.getElementById('chat-status');
-  if (!text) {
-    el.innerHTML = '';
+// --- Inline Tool Activity Cards ---
+
+function getOrCreateActivityGroup() {
+  if (_activeGroup) return _activeGroup;
+  const container = document.getElementById('chat-messages');
+  const group = document.createElement('div');
+  group.className = 'activity-group';
+  container.appendChild(group);
+  container.scrollTop = container.scrollHeight;
+  _activeGroup = group;
+  _activeToolCards = {};
+  return group;
+}
+
+function showActivityThinking(message) {
+  const group = getOrCreateActivityGroup();
+  if (_activityThinking) {
+    // Already exists — just update text and un-hide
+    _activityThinking.style.display = '';
+    _activityThinking.querySelector('.activity-thinking-text').textContent = message;
+  } else {
+    _activityThinking = document.createElement('div');
+    _activityThinking.className = 'activity-thinking';
+    _activityThinking.innerHTML =
+      '<span class="activity-thinking-dots">'
+      + '<span class="activity-thinking-dot"></span>'
+      + '<span class="activity-thinking-dot"></span>'
+      + '<span class="activity-thinking-dot"></span>'
+      + '</span>'
+      + '<span class="activity-thinking-text"></span>';
+    group.appendChild(_activityThinking);
+    _activityThinking.querySelector('.activity-thinking-text').textContent = message;
+  }
+  const container = document.getElementById('chat-messages');
+  container.scrollTop = container.scrollHeight;
+}
+
+function removeActivityThinking() {
+  if (_activityThinking) {
+    _activityThinking.remove();
+    _activityThinking = null;
+  }
+}
+
+function addToolCard(name) {
+  // Hide thinking instead of destroying — it may reappear between tool rounds
+  if (_activityThinking) _activityThinking.style.display = 'none';
+  const group = getOrCreateActivityGroup();
+
+  const card = document.createElement('div');
+  card.className = 'activity-tool-card';
+  card.setAttribute('data-tool-name', name);
+  card.setAttribute('data-status', 'running');
+
+  const header = document.createElement('div');
+  header.className = 'activity-tool-header';
+
+  const icon = document.createElement('span');
+  icon.className = 'activity-tool-icon';
+  icon.innerHTML = '<div class="spinner"></div>';
+
+  const toolName = document.createElement('span');
+  toolName.className = 'activity-tool-name';
+  toolName.textContent = name;
+
+  const duration = document.createElement('span');
+  duration.className = 'activity-tool-duration';
+  duration.textContent = '';
+
+  const chevron = document.createElement('span');
+  chevron.className = 'activity-tool-chevron';
+  chevron.innerHTML = '&#9656;';
+
+  header.appendChild(icon);
+  header.appendChild(toolName);
+  header.appendChild(duration);
+  header.appendChild(chevron);
+
+  const body = document.createElement('div');
+  body.className = 'activity-tool-body';
+  body.style.display = 'none';
+
+  const output = document.createElement('pre');
+  output.className = 'activity-tool-output';
+  body.appendChild(output);
+
+  header.addEventListener('click', () => {
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : 'block';
+    chevron.classList.toggle('expanded', !isOpen);
+  });
+
+  card.appendChild(header);
+  card.appendChild(body);
+  group.appendChild(card);
+
+  const startTime = Date.now();
+  const timerInterval = setInterval(() => {
+    const elapsed = (Date.now() - startTime) / 1000;
+    if (elapsed > 300) { clearInterval(timerInterval); return; }
+    duration.textContent = elapsed < 10 ? elapsed.toFixed(1) + 's' : Math.floor(elapsed) + 's';
+  }, 100);
+
+  if (!_activeToolCards[name]) _activeToolCards[name] = [];
+  _activeToolCards[name].push({ card, startTime, timer: timerInterval, duration, icon, finalDuration: null });
+
+  const container = document.getElementById('chat-messages');
+  container.scrollTop = container.scrollHeight;
+}
+
+function completeToolCard(name, success, error, parameters) {
+  const entries = _activeToolCards[name];
+  if (!entries || entries.length === 0) return;
+  // Find first running card
+  let entry = null;
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].card.getAttribute('data-status') === 'running') {
+      entry = entries[i];
+      break;
+    }
+  }
+  if (!entry) entry = entries[entries.length - 1];
+
+  clearInterval(entry.timer);
+  const elapsed = (Date.now() - entry.startTime) / 1000;
+  entry.finalDuration = elapsed;
+  entry.duration.textContent = elapsed < 10 ? elapsed.toFixed(1) + 's' : Math.floor(elapsed) + 's';
+  entry.icon.innerHTML = success
+    ? '<span class="activity-icon-success">&#10003;</span>'
+    : '<span class="activity-icon-fail">&#10007;</span>';
+  entry.card.setAttribute('data-status', success ? 'success' : 'fail');
+
+  // For failed tools, populate the body with error details and auto-expand
+  if (!success && (error || parameters)) {
+    const output = entry.card.querySelector('.activity-tool-output');
+    if (output) {
+      let detail = '';
+      if (parameters) {
+        detail += 'Input:\n' + parameters + '\n\n';
+      }
+      if (error) {
+        detail += 'Error:\n' + error;
+      }
+      output.textContent = detail;
+
+      // Auto-expand so the error is immediately visible
+      const body = entry.card.querySelector('.activity-tool-body');
+      const chevron = entry.card.querySelector('.activity-tool-chevron');
+      if (body) body.style.display = 'block';
+      if (chevron) chevron.classList.add('expanded');
+    }
+  }
+}
+
+function setToolCardOutput(name, preview) {
+  const entries = _activeToolCards[name];
+  if (!entries || entries.length === 0) return;
+  // Find first card with empty output
+  let entry = null;
+  for (let i = 0; i < entries.length; i++) {
+    const out = entries[i].card.querySelector('.activity-tool-output');
+    if (out && !out.textContent) {
+      entry = entries[i];
+      break;
+    }
+  }
+  if (!entry) entry = entries[entries.length - 1];
+
+  const output = entry.card.querySelector('.activity-tool-output');
+  if (output) {
+    const truncated = preview.length > 2000 ? preview.substring(0, 2000) + '\n... (truncated)' : preview;
+    output.textContent = truncated;
+  }
+}
+
+function finalizeActivityGroup() {
+  removeActivityThinking();
+  if (!_activeGroup) return;
+
+  // Stop all timers
+  for (const name in _activeToolCards) {
+    const entries = _activeToolCards[name];
+    for (let i = 0; i < entries.length; i++) {
+      clearInterval(entries[i].timer);
+    }
+  }
+
+  // Count tools and total duration
+  let toolCount = 0;
+  let totalDuration = 0;
+  for (const tname in _activeToolCards) {
+    const tentries = _activeToolCards[tname];
+    for (let j = 0; j < tentries.length; j++) {
+      const entry = tentries[j];
+      toolCount++;
+      if (entry.finalDuration !== null) {
+        totalDuration += entry.finalDuration;
+      } else {
+        // Tool was still running when finalized
+        totalDuration += (Date.now() - entry.startTime) / 1000;
+      }
+    }
+  }
+
+  if (toolCount === 0) {
+    // No tools were used — remove the empty group
+    _activeGroup.remove();
+    _activeGroup = null;
+    _activeToolCards = {};
     return;
   }
-  el.innerHTML = (spinning ? '<div class="spinner"></div>' : '') + escapeHtml(text);
+
+  // Wrap existing cards into a hidden container
+  const cardsContainer = document.createElement('div');
+  cardsContainer.className = 'activity-cards-container';
+  cardsContainer.style.display = 'none';
+
+  const cards = _activeGroup.querySelectorAll('.activity-tool-card');
+  for (let k = 0; k < cards.length; k++) {
+    cardsContainer.appendChild(cards[k]);
+  }
+
+  // Build summary line
+  const durationStr = totalDuration < 10 ? totalDuration.toFixed(1) + 's' : Math.floor(totalDuration) + 's';
+  const toolWord = toolCount === 1 ? 'tool' : 'tools';
+  const summary = document.createElement('div');
+  summary.className = 'activity-summary';
+  summary.innerHTML = '<span class="activity-summary-chevron">&#9656;</span>'
+    + '<span class="activity-summary-text">Used ' + toolCount + ' ' + toolWord + '</span>'
+    + '<span class="activity-summary-duration">(' + durationStr + ')</span>';
+
+  summary.addEventListener('click', () => {
+    const isOpen = cardsContainer.style.display !== 'none';
+    cardsContainer.style.display = isOpen ? 'none' : 'block';
+    summary.querySelector('.activity-summary-chevron').classList.toggle('expanded', !isOpen);
+  });
+
+  // Clear group and add summary + hidden cards
+  _activeGroup.innerHTML = '';
+  _activeGroup.classList.add('collapsed');
+  _activeGroup.appendChild(summary);
+  _activeGroup.appendChild(cardsContainer);
+
+  _activeGroup = null;
+  _activeToolCards = {};
 }
 
 function showApproval(data) {
@@ -505,7 +1033,7 @@ function showAuthCard(data) {
     oauthBtn.className = 'auth-oauth';
     oauthBtn.textContent = 'Authenticate with ' + data.extension_name;
     oauthBtn.addEventListener('click', () => {
-      window.open(data.auth_url, '_blank', 'width=600,height=700');
+      openOAuthUrl(data.auth_url);
     });
     links.appendChild(oauthBtn);
   }
@@ -528,7 +1056,7 @@ function showAuthCard(data) {
 
   const tokenInput = document.createElement('input');
   tokenInput.type = 'password';
-  tokenInput.placeholder = 'Paste your API key or token';
+  tokenInput.placeholder = data.instructions || 'Paste your API key or token';
   tokenInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
   });
@@ -636,18 +1164,37 @@ function loadHistory(before) {
       // Fresh load: clear and render
       container.innerHTML = '';
       for (const turn of data.turns) {
-        addMessage('user', turn.user_input);
+        if (turn.user_input) {
+          addMessage('user', turn.user_input);
+        }
+        if (turn.tool_calls && turn.tool_calls.length > 0) {
+          addToolCallsSummary(turn.tool_calls);
+        }
         if (turn.response) {
           addMessage('assistant', turn.response);
         }
+      }
+      // Show processing indicator if the last turn is still in-progress
+      var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
+      if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
+        showActivityThinking('Processing...');
+      }
+      // Re-render pending approval card if the thread is awaiting approval
+      if (data.pending_approval) {
+        showApproval(data.pending_approval);
       }
     } else {
       // Pagination: prepend older messages
       const savedHeight = container.scrollHeight;
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
-        const userDiv = createMessageElement('user', turn.user_input);
-        fragment.appendChild(userDiv);
+        if (turn.user_input) {
+          const userDiv = createMessageElement('user', turn.user_input);
+          fragment.appendChild(userDiv);
+        }
+        if (turn.tool_calls && turn.tool_calls.length > 0) {
+          fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
+        }
         if (turn.response) {
           const assistantDiv = createMessageElement('assistant', turn.response);
           fragment.appendChild(assistantDiv);
@@ -681,12 +1228,98 @@ function createMessageElement(role, content) {
   return div;
 }
 
+function addToolCallsSummary(toolCalls) {
+  const container = document.getElementById('chat-messages');
+  container.appendChild(createToolCallsSummaryElement(toolCalls));
+  container.scrollTop = container.scrollHeight;
+}
+
+function createToolCallsSummaryElement(toolCalls) {
+  const div = document.createElement('div');
+  div.className = 'tool-calls-summary';
+
+  const header = document.createElement('div');
+  header.className = 'tool-calls-header';
+  header.textContent = toolCalls.length + ' tool' + (toolCalls.length !== 1 ? 's' : '') + ' used';
+  div.appendChild(header);
+
+  const list = document.createElement('div');
+  list.className = 'tool-calls-list';
+
+  for (const tc of toolCalls) {
+    const item = document.createElement('div');
+    item.className = 'tool-call-item' + (tc.has_error ? ' tool-error' : '');
+
+    const icon = tc.has_error ? '\u2717' : '\u2713';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'tool-call-name';
+    nameSpan.textContent = icon + ' ' + tc.name;
+    item.appendChild(nameSpan);
+
+    if (tc.result_preview) {
+      const preview = document.createElement('div');
+      preview.className = 'tool-call-preview';
+      preview.textContent = tc.result_preview;
+      item.appendChild(preview);
+    }
+    if (tc.error) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'tool-call-error-text';
+      errDiv.textContent = tc.error;
+      item.appendChild(errDiv);
+    }
+
+    list.appendChild(item);
+  }
+
+  div.appendChild(list);
+
+  header.style.cursor = 'pointer';
+  header.addEventListener('click', () => {
+    list.classList.toggle('expanded');
+    header.classList.toggle('expanded');
+  });
+
+  return div;
+}
+
 function removeScrollSpinner() {
   const spinner = document.getElementById('scroll-load-spinner');
   if (spinner) spinner.remove();
 }
 
 // --- Threads ---
+
+function threadTitle(thread) {
+  if (thread.title) return thread.title;
+  const ch = thread.channel || 'gateway';
+  if (thread.thread_type === 'heartbeat') return 'Heartbeat Alerts';
+  if (thread.thread_type === 'routine') return 'Routine';
+  if (ch !== 'gateway') return ch.charAt(0).toUpperCase() + ch.slice(1);
+  if (thread.turn_count === 0) return 'New chat';
+  return thread.id.substring(0, 8);
+}
+
+function relativeTime(isoStr) {
+  if (!isoStr) return '';
+  const diff = Date.now() - new Date(isoStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  const days = Math.floor(hrs / 24);
+  return days + 'd ago';
+}
+
+function isReadOnlyChannel(channel) {
+  return channel && channel !== 'gateway' && channel !== 'routine' && channel !== 'heartbeat';
+}
+
+function debouncedLoadThreads() {
+  if (_loadThreadsTimer) clearTimeout(_loadThreadsTimer);
+  _loadThreadsTimer = setTimeout(() => { _loadThreadsTimer = null; loadThreads(); }, 500);
+}
 
 function loadThreads() {
   apiFetch('/api/chat/threads').then((data) => {
@@ -696,9 +1329,13 @@ function loadThreads() {
       const el = document.getElementById('assistant-thread');
       const isActive = currentThreadId === assistantThreadId;
       el.className = 'assistant-item' + (isActive ? ' active' : '');
+      const labelEl = document.getElementById('assistant-label');
+      if (labelEl) {
+        const at = data.assistant_thread;
+        labelEl.textContent = 'Assistant';
+      }
       const meta = document.getElementById('assistant-meta');
-      const count = data.assistant_thread.turn_count || 0;
-      meta.textContent = count > 0 ? count + ' turns' : '';
+      meta.textContent = relativeTime(data.assistant_thread.updated_at);
     }
 
     // Regular threads
@@ -707,16 +1344,38 @@ function loadThreads() {
     const threads = data.threads || [];
     for (const thread of threads) {
       const item = document.createElement('div');
-      item.className = 'thread-item' + (thread.id === currentThreadId ? ' active' : '');
+      const isActive = thread.id === currentThreadId;
+      item.className = 'thread-item' + (isActive ? ' active' : '');
+
+      // Channel badge for non-gateway threads
+      const ch = thread.channel || 'gateway';
+      if (ch !== 'gateway') {
+        const badge = document.createElement('span');
+        badge.className = 'thread-badge thread-badge-' + ch;
+        badge.textContent = ch;
+        item.appendChild(badge);
+      }
+
       const label = document.createElement('span');
       label.className = 'thread-label';
-      label.textContent = thread.title || thread.id.substring(0, 8);
-      label.title = thread.title ? thread.title + ' (' + thread.id + ')' : thread.id;
+      label.textContent = threadTitle(thread);
+      label.title = (thread.title || '') + ' (' + thread.id + ')';
       item.appendChild(label);
+
       const meta = document.createElement('span');
       meta.className = 'thread-meta';
-      meta.textContent = (thread.turn_count || 0) + ' turns';
+      meta.textContent = relativeTime(thread.updated_at);
       item.appendChild(meta);
+
+      // Unread dot
+      const unread = unreadThreads.get(thread.id) || 0;
+      if (unread > 0 && !isActive) {
+        const dot = document.createElement('span');
+        dot.className = 'thread-unread';
+        dot.textContent = unread > 9 ? '9+' : String(unread);
+        item.appendChild(dot);
+      }
+
       item.addEventListener('click', () => switchThread(thread.id));
       list.appendChild(item);
     }
@@ -725,12 +1384,37 @@ function loadThreads() {
     if (!currentThreadId && assistantThreadId) {
       switchToAssistant();
     }
+
+    // Enable/disable chat input based on channel type
+    if (currentThreadId) {
+      const currentThread = threads.find(t => t.id === currentThreadId);
+      const ch = currentThread ? currentThread.channel : 'gateway';
+      currentThreadIsReadOnly = isReadOnlyChannel(ch);
+      if (currentThreadIsReadOnly) {
+        disableChatInputReadOnly();
+      } else {
+        enableChatInput();
+      }
+    }
   }).catch(() => {});
+}
+
+function disableChatInputReadOnly() {
+  const input = document.getElementById('chat-input');
+  const btn = document.getElementById('send-btn');
+  if (input) {
+    input.disabled = true;
+    input.placeholder = 'Read-only thread (external channel)';
+  }
+  if (btn) btn.disabled = true;
 }
 
 function switchToAssistant() {
   if (!assistantThreadId) return;
+  finalizeActivityGroup();
   currentThreadId = assistantThreadId;
+  currentThreadIsReadOnly = false;
+  unreadThreads.delete(assistantThreadId);
   hasMore = false;
   oldestTimestamp = null;
   loadHistory();
@@ -738,7 +1422,9 @@ function switchToAssistant() {
 }
 
 function switchThread(threadId) {
+  finalizeActivityGroup();
   currentThreadId = threadId;
+  unreadThreads.delete(threadId);
   hasMore = false;
   oldestTimestamp = null;
   loadHistory();
@@ -749,7 +1435,6 @@ function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
     document.getElementById('chat-messages').innerHTML = '';
-    setStatus('');
     loadThreads();
   }).catch((err) => {
     showToast('Failed to create thread: ' + err.message, 'error');
@@ -766,12 +1451,50 @@ function toggleThreadSidebar() {
 // Chat input auto-resize and keyboard handling
 const chatInput = document.getElementById('chat-input');
 chatInput.addEventListener('keydown', (e) => {
+  const acEl = document.getElementById('slash-autocomplete');
+  const acVisible = acEl && acEl.style.display !== 'none';
+
+  if (acVisible) {
+    const items = acEl.querySelectorAll('.slash-ac-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      _slashSelected = Math.min(_slashSelected + 1, items.length - 1);
+      updateSlashHighlight();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      _slashSelected = Math.max(_slashSelected - 1, -1);
+      updateSlashHighlight();
+      return;
+    }
+    if (e.key === 'Tab' || e.key === 'Enter') {
+      e.preventDefault();
+      const pick = _slashSelected >= 0 ? _slashMatches[_slashSelected] : _slashMatches[0];
+      if (pick) selectSlashItem(pick.cmd);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hideSlashAutocomplete();
+      return;
+    }
+  }
+
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
+    hideSlashAutocomplete();
     sendMessage();
   }
 });
-chatInput.addEventListener('input', () => autoResizeTextarea(chatInput));
+chatInput.addEventListener('input', () => {
+  autoResizeTextarea(chatInput);
+  filterSlashCommands(chatInput.value);
+});
+chatInput.addEventListener('blur', () => {
+  // Small delay so mousedown on autocomplete item fires first
+  setTimeout(hideSlashAutocomplete, 150);
+});
 
 // Infinite scroll: load older messages when scrolled near the top
 document.getElementById('chat-messages').addEventListener('scroll', function () {
@@ -814,7 +1537,13 @@ function switchTab(tab) {
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
   if (tab === 'logs') applyLogFilters();
-  if (tab === 'extensions') loadExtensions();
+  if (tab === 'extensions') {
+    loadExtensions();
+    startPairingPoll();
+  } else {
+    stopPairingPoll();
+  }
+  if (tab === 'skills') loadSkills();
 }
 
 // --- Memory (filesystem tree) ---
@@ -996,7 +1725,9 @@ function buildBreadcrumb(path) {
   let current = '';
   for (const part of parts) {
     current += (current ? '/' : '') + part;
-    html += ' / <a onclick="readMemoryFile(\'' + escapeHtml(current) + '\')">' + escapeHtml(part) + '</a>';
+    // Store the path in data-path (HTML-escaped) and read it back via this.dataset.path
+    // to avoid single-quote injection in inline JS string literals.
+    html += ' / <a onclick="readMemoryFile(this.dataset.path)" data-path="' + escapeHtml(current) + '">' + escapeHtml(part) + '</a>';
   }
   return html;
 }
@@ -1069,7 +1800,7 @@ function connectLogSSE() {
       logBuffer.push(entry);
       return;
     }
-    appendLogEntry(entry);
+    prependLogEntry(entry);
   });
 
   logEventSource.onerror = () => {
@@ -1077,7 +1808,7 @@ function connectLogSSE() {
   };
 }
 
-function appendLogEntry(entry) {
+function prependLogEntry(entry) {
   const output = document.getElementById('logs-output');
 
   // Level filter
@@ -1118,16 +1849,16 @@ function appendLogEntry(entry) {
     div.style.display = 'none';
   }
 
-  output.appendChild(div);
+  output.prepend(div);
 
-  // Cap entries
+  // Cap entries (remove oldest at the bottom)
   while (output.children.length > LOG_MAX_ENTRIES) {
-    output.removeChild(output.firstChild);
+    output.removeChild(output.lastChild);
   }
 
-  // Auto-scroll
+  // Auto-scroll to top (newest entries are at the top)
   if (document.getElementById('logs-autoscroll').checked) {
-    output.scrollTop = output.scrollHeight;
+    output.scrollTop = 0;
   }
 }
 
@@ -1137,9 +1868,9 @@ function toggleLogsPause() {
   btn.textContent = logsPaused ? 'Resume' : 'Pause';
 
   if (!logsPaused) {
-    // Flush buffer
+    // Flush buffer: oldest-first + prepend naturally puts newest at top
     for (const entry of logBuffer) {
-      appendLogEntry(entry);
+      prependLogEntry(entry);
     }
     logBuffer = [];
   }
@@ -1166,25 +1897,76 @@ function applyLogFilters() {
   }
 }
 
+// --- Server-side log level control ---
+
+function setServerLogLevel(level) {
+  apiFetch('/api/logs/level', {
+    method: 'PUT',
+    body: { level },
+  })
+    .then(data => {
+      document.getElementById('logs-server-level').value = data.level;
+    })
+    .catch(err => console.error('Failed to set server log level:', err));
+}
+
+function loadServerLogLevel() {
+  apiFetch('/api/logs/level')
+    .then(data => {
+      document.getElementById('logs-server-level').value = data.level;
+    })
+    .catch(() => {}); // ignore if not available
+}
+
 // --- Extensions ---
+
+var kindLabels = { 'wasm_channel': 'Channel', 'wasm_tool': 'Tool', 'mcp_server': 'MCP' };
 
 function loadExtensions() {
   const extList = document.getElementById('extensions-list');
+  const wasmList = document.getElementById('available-wasm-list');
+  const mcpList = document.getElementById('mcp-servers-list');
   const toolsTbody = document.getElementById('tools-tbody');
   const toolsEmpty = document.getElementById('tools-empty');
 
-  // Fetch both in parallel
+  // Fetch all three in parallel
   Promise.all([
     apiFetch('/api/extensions').catch(() => ({ extensions: [] })),
     apiFetch('/api/extensions/tools').catch(() => ({ tools: [] })),
-  ]).then(([extData, toolData]) => {
-    // Render extensions
+    apiFetch('/api/extensions/registry').catch(function(err) { console.warn('registry fetch failed:', err); return { entries: [] }; }),
+  ]).then(([extData, toolData, registryData]) => {
+    // Render installed extensions
     if (extData.extensions.length === 0) {
       extList.innerHTML = '<div class="empty-state">No extensions installed</div>';
     } else {
       extList.innerHTML = '';
       for (const ext of extData.extensions) {
         extList.appendChild(renderExtensionCard(ext));
+      }
+    }
+
+    // Split registry entries by kind
+    var wasmEntries = registryData.entries.filter(function(e) { return e.kind !== 'mcp_server' && !e.installed; });
+    var mcpEntries = registryData.entries.filter(function(e) { return e.kind === 'mcp_server'; });
+
+    // Available WASM extensions
+    if (wasmEntries.length === 0) {
+      wasmList.innerHTML = '<div class="empty-state">No additional WASM extensions available</div>';
+    } else {
+      wasmList.innerHTML = '';
+      for (const entry of wasmEntries) {
+        wasmList.appendChild(renderAvailableExtensionCard(entry));
+      }
+    }
+
+    // MCP servers (show both installed and uninstalled)
+    if (mcpEntries.length === 0) {
+      mcpList.innerHTML = '<div class="empty-state">No MCP servers available</div>';
+    } else {
+      mcpList.innerHTML = '';
+      for (const entry of mcpEntries) {
+        var installedExt = extData.extensions.find(function(e) { return e.name === entry.name; });
+        mcpList.appendChild(renderMcpServerCard(entry, installedExt));
       }
     }
 
@@ -1201,6 +1983,173 @@ function loadExtensions() {
   });
 }
 
+function renderAvailableExtensionCard(entry) {
+  const card = document.createElement('div');
+  card.className = 'ext-card ext-available';
+
+  const header = document.createElement('div');
+  header.className = 'ext-header';
+
+  const name = document.createElement('span');
+  name.className = 'ext-name';
+  name.textContent = entry.display_name;
+  header.appendChild(name);
+
+  const kind = document.createElement('span');
+  kind.className = 'ext-kind kind-' + entry.kind;
+  kind.textContent = kindLabels[entry.kind] || entry.kind;
+  header.appendChild(kind);
+
+  if (entry.version) {
+    const ver = document.createElement('span');
+    ver.className = 'ext-version';
+    ver.textContent = 'v' + entry.version;
+    header.appendChild(ver);
+  }
+
+  card.appendChild(header);
+
+  const desc = document.createElement('div');
+  desc.className = 'ext-desc';
+  desc.textContent = entry.description;
+  card.appendChild(desc);
+
+  if (entry.keywords && entry.keywords.length > 0) {
+    const kw = document.createElement('div');
+    kw.className = 'ext-keywords';
+    kw.textContent = entry.keywords.join(', ');
+    card.appendChild(kw);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'ext-actions';
+
+  const installBtn = document.createElement('button');
+  installBtn.className = 'btn-ext install';
+  installBtn.textContent = 'Install';
+  installBtn.addEventListener('click', function() {
+    installBtn.disabled = true;
+    installBtn.textContent = 'Installing...';
+    apiFetch('/api/extensions/install', {
+      method: 'POST',
+      body: { name: entry.name, kind: entry.kind },
+    }).then(function(res) {
+      if (res.success) {
+        showToast('Installed ' + entry.display_name, 'success');
+        // OAuth popup if auth started during install (builtin creds)
+        if (res.auth_url) {
+          showToast('Opening authentication for ' + entry.display_name, 'info');
+          openOAuthUrl(res.auth_url);
+        }
+        loadExtensions();
+        // Auto-open configure for WASM channels
+        if (entry.kind === 'wasm_channel') {
+          showConfigureModal(entry.name);
+        }
+      } else {
+        showToast('Install: ' + (res.message || 'unknown error'), 'error');
+        loadExtensions();
+      }
+    }).catch(function(err) {
+      showToast('Install failed: ' + err.message, 'error');
+      loadExtensions();
+    });
+  });
+  actions.appendChild(installBtn);
+
+  card.appendChild(actions);
+  return card;
+}
+
+function renderMcpServerCard(entry, installedExt) {
+  var card = document.createElement('div');
+  card.className = 'ext-card' + (installedExt ? '' : ' ext-available');
+
+  var header = document.createElement('div');
+  header.className = 'ext-header';
+
+  var name = document.createElement('span');
+  name.className = 'ext-name';
+  name.textContent = entry.display_name;
+  header.appendChild(name);
+
+  var kind = document.createElement('span');
+  kind.className = 'ext-kind kind-mcp_server';
+  kind.textContent = kindLabels['mcp_server'] || 'mcp_server';
+  header.appendChild(kind);
+
+  if (installedExt) {
+    var authDot = document.createElement('span');
+    authDot.className = 'ext-auth-dot ' + (installedExt.authenticated ? 'authed' : 'unauthed');
+    authDot.title = installedExt.authenticated ? 'Authenticated' : 'Not authenticated';
+    header.appendChild(authDot);
+  }
+
+  card.appendChild(header);
+
+  var desc = document.createElement('div');
+  desc.className = 'ext-desc';
+  desc.textContent = entry.description;
+  card.appendChild(desc);
+
+  var actions = document.createElement('div');
+  actions.className = 'ext-actions';
+
+  if (installedExt) {
+    if (!installedExt.active) {
+      var activateBtn = document.createElement('button');
+      activateBtn.className = 'btn-ext activate';
+      activateBtn.textContent = 'Activate';
+      activateBtn.addEventListener('click', function() { activateExtension(installedExt.name); });
+      actions.appendChild(activateBtn);
+    } else {
+      var activeLabel = document.createElement('span');
+      activeLabel.className = 'ext-active-label';
+      activeLabel.textContent = 'Active';
+      actions.appendChild(activeLabel);
+    }
+    var removeBtn = document.createElement('button');
+    removeBtn.className = 'btn-ext remove';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', function() { removeExtension(installedExt.name); });
+    actions.appendChild(removeBtn);
+  } else {
+    var installBtn = document.createElement('button');
+    installBtn.className = 'btn-ext install';
+    installBtn.textContent = 'Install';
+    installBtn.addEventListener('click', function() {
+      installBtn.disabled = true;
+      installBtn.textContent = 'Installing...';
+      apiFetch('/api/extensions/install', {
+        method: 'POST',
+        body: { name: entry.name, kind: entry.kind },
+      }).then(function(res) {
+        if (res.success) {
+          showToast('Installed ' + entry.display_name, 'success');
+        } else {
+          showToast('Install: ' + (res.message || 'unknown error'), 'error');
+        }
+        loadExtensions();
+      }).catch(function(err) {
+        showToast('Install failed: ' + err.message, 'error');
+        loadExtensions();
+      });
+    });
+    actions.appendChild(installBtn);
+  }
+
+  card.appendChild(actions);
+  return card;
+}
+
+function createReconfigureButton(extName) {
+  var btn = document.createElement('button');
+  btn.className = 'btn-ext configure';
+  btn.textContent = 'Reconfigure';
+  btn.addEventListener('click', function() { showConfigureModal(extName); });
+  return btn;
+}
+
 function renderExtensionCard(ext) {
   const card = document.createElement('div');
   card.className = 'ext-card';
@@ -1210,20 +2159,35 @@ function renderExtensionCard(ext) {
 
   const name = document.createElement('span');
   name.className = 'ext-name';
-  name.textContent = ext.name;
+  name.textContent = ext.display_name || ext.name;
   header.appendChild(name);
 
   const kind = document.createElement('span');
   kind.className = 'ext-kind kind-' + ext.kind;
-  kind.textContent = ext.kind;
+  kind.textContent = kindLabels[ext.kind] || ext.kind;
   header.appendChild(kind);
 
-  const authDot = document.createElement('span');
-  authDot.className = 'ext-auth-dot ' + (ext.authenticated ? 'authed' : 'unauthed');
-  authDot.title = ext.authenticated ? 'Authenticated' : 'Not authenticated';
-  header.appendChild(authDot);
+  if (ext.version) {
+    const ver = document.createElement('span');
+    ver.className = 'ext-version';
+    ver.textContent = 'v' + ext.version;
+    header.appendChild(ver);
+  }
+
+  // Auth dot only for non-WASM-channel extensions (channels use the stepper instead)
+  if (ext.kind !== 'wasm_channel') {
+    const authDot = document.createElement('span');
+    authDot.className = 'ext-auth-dot ' + (ext.authenticated ? 'authed' : 'unauthed');
+    authDot.title = ext.authenticated ? 'Authenticated' : 'Not authenticated';
+    header.appendChild(authDot);
+  }
 
   card.appendChild(header);
+
+  // WASM channels get a progress stepper
+  if (ext.kind === 'wasm_channel') {
+    card.appendChild(renderWasmChannelStepper(ext));
+  }
 
   if (ext.description) {
     const desc = document.createElement('div');
@@ -1240,27 +2204,77 @@ function renderExtensionCard(ext) {
     card.appendChild(url);
   }
 
-  if (ext.tools.length > 0) {
+  if (ext.tools && ext.tools.length > 0) {
     const tools = document.createElement('div');
     tools.className = 'ext-tools';
     tools.textContent = 'Tools: ' + ext.tools.join(', ');
     card.appendChild(tools);
   }
 
+  // Show activation error for WASM channels
+  if (ext.kind === 'wasm_channel' && ext.activation_error) {
+    const errorDiv = document.createElement('div');
+    errorDiv.className = 'ext-error';
+    errorDiv.textContent = ext.activation_error;
+    card.appendChild(errorDiv);
+  }
+
+
   const actions = document.createElement('div');
   actions.className = 'ext-actions';
 
-  if (!ext.active) {
-    const activateBtn = document.createElement('button');
-    activateBtn.className = 'btn-ext activate';
-    activateBtn.textContent = 'Activate';
-    activateBtn.addEventListener('click', () => activateExtension(ext.name));
-    actions.appendChild(activateBtn);
+  if (ext.kind === 'wasm_channel') {
+    // WASM channels: state-based buttons (no generic Activate)
+    var status = ext.activation_status || 'installed';
+    if (status === 'active') {
+      var activeLabel = document.createElement('span');
+      activeLabel.className = 'ext-active-label';
+      activeLabel.textContent = 'Active';
+      actions.appendChild(activeLabel);
+      actions.appendChild(createReconfigureButton(ext.name));
+    } else if (status === 'pairing') {
+      var pairingLabel = document.createElement('span');
+      pairingLabel.className = 'ext-pairing-label';
+      pairingLabel.textContent = 'Awaiting Pairing';
+      actions.appendChild(pairingLabel);
+      actions.appendChild(createReconfigureButton(ext.name));
+    } else if (status === 'failed') {
+      actions.appendChild(createReconfigureButton(ext.name));
+    } else {
+      // installed or configured: show Setup button
+      var setupBtn = document.createElement('button');
+      setupBtn.className = 'btn-ext configure';
+      setupBtn.textContent = 'Setup';
+      setupBtn.addEventListener('click', function() { showConfigureModal(ext.name); });
+      actions.appendChild(setupBtn);
+    }
   } else {
+    // WASM tools / MCP servers
     const activeLabel = document.createElement('span');
     activeLabel.className = 'ext-active-label';
-    activeLabel.textContent = 'Active';
+    activeLabel.textContent = ext.active ? 'Active' : 'Installed';
     actions.appendChild(activeLabel);
+
+    // MCP servers may be installed but inactive — show Activate button
+    if (ext.kind === 'mcp_server' && !ext.active) {
+      const activateBtn = document.createElement('button');
+      activateBtn.className = 'btn-ext activate';
+      activateBtn.textContent = 'Activate';
+      activateBtn.addEventListener('click', () => activateExtension(ext.name));
+      actions.appendChild(activateBtn);
+    }
+
+    // Show Configure/Reconfigure button when there are secrets to enter.
+    // Skip when has_auth is true but needs_setup is false and not yet authenticated —
+    // this means OAuth credentials resolve automatically (builtin/env) and the user
+    // just needs to complete the OAuth flow, not fill in a config form.
+    if (ext.needs_setup || (ext.has_auth && ext.authenticated)) {
+      const configBtn = document.createElement('button');
+      configBtn.className = 'btn-ext configure';
+      configBtn.textContent = ext.authenticated ? 'Reconfigure' : 'Configure';
+      configBtn.addEventListener('click', () => showConfigureModal(ext.name));
+      actions.appendChild(configBtn);
+    }
   }
 
   const removeBtn = document.createElement('button');
@@ -1270,6 +2284,16 @@ function renderExtensionCard(ext) {
   actions.appendChild(removeBtn);
 
   card.appendChild(actions);
+
+  // For WASM channels, check for pending pairing requests.
+  if (ext.kind === 'wasm_channel') {
+    const pairingSection = document.createElement('div');
+    pairingSection.className = 'ext-pairing';
+    pairingSection.setAttribute('data-channel', ext.name);
+    card.appendChild(pairingSection);
+    loadPairingRequests(ext.name, pairingSection);
+  }
+
   return card;
 }
 
@@ -1277,15 +2301,20 @@ function activateExtension(name) {
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/activate', { method: 'POST' })
     .then((res) => {
       if (res.success) {
+        // Even on success, the tool may need OAuth (e.g., WASM loaded but no token yet)
+        if (res.auth_url) {
+          showToast('Opening authentication for ' + name, 'info');
+          openOAuthUrl(res.auth_url);
+        }
         loadExtensions();
         return;
       }
 
       if (res.auth_url) {
         showToast('Opening authentication for ' + name, 'info');
-        window.open(res.auth_url, '_blank');
+        openOAuthUrl(res.auth_url);
       } else if (res.awaiting_token) {
-        showToast(res.instructions || 'Please provide an API token for ' + name, 'info');
+        showConfigureModal(name);
       } else {
         showToast('Activate failed: ' + res.message, 'error');
       }
@@ -1306,6 +2335,303 @@ function removeExtension(name) {
       loadExtensions();
     })
     .catch((err) => showToast('Remove failed: ' + err.message, 'error'));
+}
+
+function showConfigureModal(name) {
+  apiFetch('/api/extensions/' + encodeURIComponent(name) + '/setup')
+    .then((setup) => {
+      if (!setup.secrets || setup.secrets.length === 0) {
+        showToast('No configuration needed for ' + name, 'info');
+        return;
+      }
+      renderConfigureModal(name, setup.secrets);
+    })
+    .catch((err) => showToast('Failed to load setup: ' + err.message, 'error'));
+}
+
+function renderConfigureModal(name, secrets) {
+  closeConfigureModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'configure-overlay';
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) closeConfigureModal();
+  });
+
+  const modal = document.createElement('div');
+  modal.className = 'configure-modal';
+
+  const header = document.createElement('h3');
+  header.textContent = 'Configure ' + name;
+  modal.appendChild(header);
+
+  const form = document.createElement('div');
+  form.className = 'configure-form';
+
+  const fields = [];
+  for (const secret of secrets) {
+    const field = document.createElement('div');
+    field.className = 'configure-field';
+
+    const label = document.createElement('label');
+    label.textContent = secret.prompt;
+    if (secret.optional) {
+      const opt = document.createElement('span');
+      opt.className = 'field-optional';
+      opt.textContent = ' (optional)';
+      label.appendChild(opt);
+    }
+    field.appendChild(label);
+
+    const inputRow = document.createElement('div');
+    inputRow.className = 'configure-input-row';
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.name = secret.name;
+    input.placeholder = secret.provided ? '(already set — leave empty to keep)' : '';
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitConfigureModal(name, fields);
+    });
+    inputRow.appendChild(input);
+
+    if (secret.provided) {
+      const badge = document.createElement('span');
+      badge.className = 'field-provided';
+      badge.textContent = '\u2713';
+      badge.title = 'Already configured';
+      inputRow.appendChild(badge);
+    }
+    if (secret.auto_generate && !secret.provided) {
+      const hint = document.createElement('span');
+      hint.className = 'field-autogen';
+      hint.textContent = 'Auto-generated if empty';
+      inputRow.appendChild(hint);
+    }
+
+    field.appendChild(inputRow);
+    form.appendChild(field);
+    fields.push({ name: secret.name, input: input });
+  }
+
+  modal.appendChild(form);
+
+  const actions = document.createElement('div');
+  actions.className = 'configure-actions';
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'btn-ext activate';
+  submitBtn.textContent = 'Save';
+  submitBtn.addEventListener('click', () => submitConfigureModal(name, fields));
+  actions.appendChild(submitBtn);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn-ext remove';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', closeConfigureModal);
+  actions.appendChild(cancelBtn);
+
+  modal.appendChild(actions);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  if (fields.length > 0) fields[0].input.focus();
+}
+
+function submitConfigureModal(name, fields) {
+  const secrets = {};
+  for (const f of fields) {
+    if (f.input.value.trim()) {
+      secrets[f.name] = f.input.value.trim();
+    }
+  }
+
+  // Disable buttons to prevent double-submit
+  var btns = document.querySelectorAll('.configure-actions button');
+  btns.forEach(function(b) { b.disabled = true; });
+
+  apiFetch('/api/extensions/' + encodeURIComponent(name) + '/setup', {
+    method: 'POST',
+    body: { secrets },
+  })
+    .then((res) => {
+      if (res.success) {
+        closeConfigureModal();
+        if (res.auth_url) {
+          // OAuth flow started — open consent popup. The auth_completed SSE will
+          // not arrive immediately (it fires after OAuth callback), so show a toast now.
+          showToast('Opening OAuth authorization for ' + name, 'info');
+          openOAuthUrl(res.auth_url);
+          loadExtensions();
+        }
+        // For non-OAuth success: the server always broadcasts auth_completed SSE,
+        // which will show the toast and refresh extensions — no need to do it here too.
+      } else {
+        // Keep modal open so the user can correct their input and retry.
+        btns.forEach(function(b) { b.disabled = false; });
+        showToast(res.message || 'Configuration failed', 'error');
+      }
+    })
+    .catch((err) => {
+      btns.forEach(function(b) { b.disabled = false; });
+      showToast('Configuration failed: ' + err.message, 'error');
+    });
+}
+
+function closeConfigureModal() {
+  const existing = document.querySelector('.configure-overlay');
+  if (existing) existing.remove();
+}
+
+// Validate that a server-supplied OAuth URL is HTTPS before opening a popup.
+// Rejects javascript:, data:, and other non-HTTPS schemes to prevent URL-injection.
+// Uses the URL constructor to safely parse and validate the scheme, which also
+// handles non-string values (objects, null, etc.) that would throw on .startsWith().
+function openOAuthUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+    if (parsed.protocol !== 'https:') {
+      throw new Error('non-HTTPS protocol: ' + parsed.protocol);
+    }
+  } catch (e) {
+    console.warn('Blocked invalid/non-HTTPS OAuth URL:', url, e.message);
+    showToast('Invalid OAuth URL returned by server', 'error');
+    return;
+  }
+  window.open(parsed.href, '_blank', 'width=600,height=700');
+}
+
+// --- Pairing ---
+
+function loadPairingRequests(channel, container) {
+  apiFetch('/api/pairing/' + encodeURIComponent(channel))
+    .then(data => {
+      container.innerHTML = '';
+      if (!data.requests || data.requests.length === 0) return;
+
+      const heading = document.createElement('div');
+      heading.className = 'pairing-heading';
+      heading.textContent = 'Pending pairing requests';
+      container.appendChild(heading);
+
+      data.requests.forEach(req => {
+        const row = document.createElement('div');
+        row.className = 'pairing-row';
+
+        const code = document.createElement('span');
+        code.className = 'pairing-code';
+        code.textContent = req.code;
+        row.appendChild(code);
+
+        const sender = document.createElement('span');
+        sender.className = 'pairing-sender';
+        sender.textContent = 'from ' + req.sender_id;
+        row.appendChild(sender);
+
+        const btn = document.createElement('button');
+        btn.className = 'btn-ext activate';
+        btn.textContent = 'Approve';
+        btn.addEventListener('click', () => approvePairing(channel, req.code, container));
+        row.appendChild(btn);
+
+        container.appendChild(row);
+      });
+    })
+    .catch(() => {});
+}
+
+function approvePairing(channel, code, container) {
+  apiFetch('/api/pairing/' + encodeURIComponent(channel) + '/approve', {
+    method: 'POST',
+    body: { code },
+  }).then(res => {
+    if (res.success) {
+      showToast('Pairing approved', 'success');
+      loadExtensions();
+    } else {
+      showToast(res.message || 'Approve failed', 'error');
+    }
+  }).catch(err => showToast('Error: ' + err.message, 'error'));
+}
+
+function startPairingPoll() {
+  stopPairingPoll();
+  pairingPollInterval = setInterval(function() {
+    document.querySelectorAll('.ext-pairing[data-channel]').forEach(function(el) {
+      loadPairingRequests(el.getAttribute('data-channel'), el);
+    });
+  }, 10000);
+}
+
+function stopPairingPoll() {
+  if (pairingPollInterval) {
+    clearInterval(pairingPollInterval);
+    pairingPollInterval = null;
+  }
+}
+
+// --- WASM channel stepper ---
+
+function renderWasmChannelStepper(ext) {
+  var stepper = document.createElement('div');
+  stepper.className = 'ext-stepper';
+
+  var status = ext.activation_status || 'installed';
+
+  var steps = [
+    { label: 'Installed', key: 'installed' },
+    { label: 'Configured', key: 'configured' },
+    { label: status === 'pairing' ? 'Awaiting Pairing' : 'Active', key: 'active' },
+  ];
+
+  var reachedIdx;
+  if (status === 'active') reachedIdx = 2;
+  else if (status === 'pairing') reachedIdx = 2;
+  else if (status === 'failed') reachedIdx = 2;
+  else if (status === 'configured') reachedIdx = 1;
+  else reachedIdx = 0;
+
+  for (var i = 0; i < steps.length; i++) {
+    if (i > 0) {
+      var connector = document.createElement('div');
+      connector.className = 'stepper-connector' + (i <= reachedIdx ? ' completed' : '');
+      stepper.appendChild(connector);
+    }
+
+    var step = document.createElement('div');
+    var stepState;
+    if (i < reachedIdx) {
+      stepState = 'completed';
+    } else if (i === reachedIdx) {
+      if (status === 'failed') {
+        stepState = 'failed';
+      } else if (status === 'pairing') {
+        stepState = 'in-progress';
+      } else if (status === 'active' || status === 'configured' || status === 'installed') {
+        stepState = 'completed';
+      } else {
+        stepState = 'pending';
+      }
+    } else {
+      stepState = 'pending';
+    }
+    step.className = 'stepper-step ' + stepState;
+
+    var circle = document.createElement('span');
+    circle.className = 'stepper-circle';
+    if (stepState === 'completed') circle.textContent = '\u2713';
+    else if (stepState === 'failed') circle.textContent = '\u2717';
+    step.appendChild(circle);
+
+    var label = document.createElement('span');
+    label.className = 'stepper-label';
+    label.textContent = steps[i].label;
+    step.appendChild(label);
+
+    stepper.appendChild(step);
+  }
+
+  return stepper;
 }
 
 // --- Jobs ---
@@ -1372,9 +2698,8 @@ function renderJobsList(jobs) {
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
       actionBtns = '<button class="btn-cancel" onclick="event.stopPropagation(); cancelJob(\'' + job.id + '\')">Cancel</button>';
-    } else if (job.state === 'failed' || job.state === 'interrupted') {
-      actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
+    // Retry is only shown in the detail view where can_restart is available.
 
     return '<tr class="job-row" onclick="openJobDetail(\'' + job.id + '\')">'
       + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
@@ -1403,10 +2728,12 @@ function restartJob(jobId) {
   apiFetch('/api/jobs/' + jobId + '/restart', { method: 'POST' })
     .then((res) => {
       showToast('Job restarted as ' + (res.new_job_id || '').substring(0, 8), 'success');
-      loadJobs();
     })
     .catch((err) => {
       showToast('Failed to restart job: ' + err.message, 'error');
+    })
+    .finally(() => {
+      loadJobs();
     });
 }
 
@@ -1441,8 +2768,8 @@ function renderJobDetail(job) {
     + '<h2>' + escapeHtml(job.title) + '</h2>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
-  if (job.state === 'failed' || job.state === 'interrupted') {
-    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Restart</button>';
+  if ((job.state === 'failed' || job.state === 'interrupted') && job.can_restart === true) {
+    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Retry</button>';
   }
   if (job.browse_url) {
     headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
@@ -1689,7 +3016,7 @@ function renderJobActivity(container, job) {
   activityCurrentJobId = job ? job.id : null;
   activityRenderedLiveIndex = 0;
 
-  container.innerHTML = '<div class="activity-toolbar">'
+  let html = '<div class="activity-toolbar">'
     + '<select id="activity-type-filter">'
     + '<option value="all">All Events</option>'
     + '<option value="message">Messages</option>'
@@ -1698,12 +3025,17 @@ function renderJobActivity(container, job) {
     + '</select>'
     + '<label class="logs-checkbox"><input type="checkbox" id="activity-autoscroll" checked> Auto-scroll</label>'
     + '</div>'
-    + '<div class="activity-terminal" id="activity-terminal"></div>'
-    + '<div class="activity-input-bar" id="activity-input-bar">'
-    + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
-    + '<button id="activity-send-btn">Send</button>'
-    + '<button id="activity-done-btn" title="Signal done">Done</button>'
-    + '</div>';
+    + '<div class="activity-terminal" id="activity-terminal"></div>';
+
+  if (job && job.can_prompt === true) {
+    html += '<div class="activity-input-bar" id="activity-input-bar">'
+      + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
+      + '<button id="activity-send-btn">Send</button>'
+      + '<button id="activity-done-btn" title="Signal done">Done</button>'
+      + '</div>';
+  }
+
+  container.innerHTML = html;
 
   document.getElementById('activity-type-filter').addEventListener('change', applyActivityFilter);
 
@@ -1712,9 +3044,9 @@ function renderJobActivity(container, job) {
   const sendBtn = document.getElementById('activity-send-btn');
   const doneBtn = document.getElementById('activity-done-btn');
 
-  sendBtn.addEventListener('click', () => sendJobPrompt(job.id, false));
-  doneBtn.addEventListener('click', () => sendJobPrompt(job.id, true));
-  input.addEventListener('keydown', (e) => {
+  if (sendBtn) sendBtn.addEventListener('click', () => sendJobPrompt(job.id, false));
+  if (doneBtn) doneBtn.addEventListener('click', () => sendJobPrompt(job.id, true));
+  if (input) input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendJobPrompt(job.id, false);
   });
 
@@ -1781,14 +3113,20 @@ function appendActivityEvent(terminal, eventType, data) {
         + escapeHtml(typeof data.input === 'string' ? data.input : JSON.stringify(data.input, null, 2))
         + '</pre></details>';
       break;
-    case 'tool_result':
-      el.innerHTML = '<details class="activity-tool-block activity-tool-result"><summary>'
-        + '<span class="activity-tool-icon">&#10003;</span> '
+    case 'tool_result': {
+      const trSuccess = data.success !== false;
+      const trIcon = trSuccess ? '&#10003;' : '&#10007;';
+      const trOutput = data.output || data.error || '';
+      const trClass = 'activity-tool-block activity-tool-result'
+        + (trSuccess ? '' : ' activity-tool-error');
+      el.innerHTML = '<details class="' + trClass + '"><summary>'
+        + '<span class="activity-tool-icon">' + trIcon + '</span> '
         + escapeHtml(data.tool_name || 'result')
         + '</summary><pre class="activity-tool-output">'
-        + escapeHtml(data.output || '')
+        + escapeHtml(trOutput)
         + '</pre></details>';
       break;
+    }
     case 'status':
       el.innerHTML = '<span class="activity-status">' + escapeHtml(data.message || '') + '</span>';
       break;
@@ -1796,7 +3134,7 @@ function appendActivityEvent(terminal, eventType, data) {
       el.className += ' activity-final';
       const success = data.success !== false;
       el.innerHTML = '<span class="activity-result-status" data-success="' + success + '">'
-        + escapeHtml(data.message || data.status || 'done') + '</span>';
+        + escapeHtml(data.message || data.error || data.status || 'done') + '</span>';
       if (data.session_id) {
         el.innerHTML += ' <span class="activity-session-id">session: ' + escapeHtml(data.session_id) + '</span>';
       }
@@ -1981,7 +3319,9 @@ function renderRoutineDetail(routine) {
         + '<td>' + formatDate(run.started_at) + '</td>'
         + '<td>' + formatDate(run.completed_at) + '</td>'
         + '<td><span class="badge ' + runStatusClass + '">' + escapeHtml(run.status) + '</span></td>'
-        + '<td>' + escapeHtml(run.result_summary || '-') + '</td>'
+        + '<td>' + escapeHtml(run.result_summary || '-')
+          + (run.job_id ? ' <a href="#" onclick="event.preventDefault(); switchTab(\'jobs\'); openJobDetail(\'' + run.job_id + '\')">[view job]</a>' : '')
+          + '</td>'
         + '<td>' + (run.tokens_used != null ? run.tokens_used : '-') + '</td>'
         + '</tr>';
     }
@@ -1993,7 +3333,11 @@ function renderRoutineDetail(routine) {
 
 function triggerRoutine(id) {
   apiFetch('/api/routines/' + id + '/trigger', { method: 'POST' })
-    .then(() => showToast('Routine triggered', 'success'))
+    .then(() => {
+      showToast('Routine triggered', 'success');
+      if (currentRoutineId === id) openRoutineDetail(id);
+      else loadRoutines();
+    })
     .catch((err) => showToast('Trigger failed: ' + err.message, 'error'));
 }
 
@@ -2048,13 +3392,78 @@ function startGatewayStatusPolling() {
   gatewayStatusInterval = setInterval(fetchGatewayStatus, 30000);
 }
 
+function formatTokenCount(n) {
+  if (n == null || n === 0) return '0';
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return '' + n;
+}
+
+function formatCost(costStr) {
+  if (!costStr) return '$0.00';
+  var n = parseFloat(costStr);
+  if (n < 0.01) return '$' + n.toFixed(4);
+  return '$' + n.toFixed(2);
+}
+
+function shortModelName(model) {
+  // Strip provider prefix and shorten common model names
+  var m = model.indexOf('/') >= 0 ? model.split('/').pop() : model;
+  // Shorten dated suffixes
+  m = m.replace(/-20\d{6}$/, '');
+  return m;
+}
+
 function fetchGatewayStatus() {
-  apiFetch('/api/gateway/status').then((data) => {
-    const popover = document.getElementById('gateway-popover');
-    popover.innerHTML = '<div class="gw-stat"><span>SSE clients</span><span>' + (data.sse_clients || 0) + '</span></div>'
-      + '<div class="gw-stat"><span>Log clients</span><span>' + (data.log_clients || 0) + '</span></div>'
-      + '<div class="gw-stat"><span>Uptime</span><span>' + formatDuration(data.uptime_secs) + '</span></div>';
-  }).catch(() => {});
+  apiFetch('/api/gateway/status').then(function(data) {
+    var popover = document.getElementById('gateway-popover');
+    var html = '';
+
+    // Version
+    if (data.version) {
+      html += '<div class="gw-section-label">IronClaw v' + escapeHtml(data.version) + '</div>';
+      html += '<div class="gw-divider"></div>';
+    }
+
+    // Connection info
+    html += '<div class="gw-section-label">Connections</div>';
+    html += '<div class="gw-stat"><span>SSE</span><span>' + (data.sse_connections || 0) + '</span></div>';
+    html += '<div class="gw-stat"><span>WebSocket</span><span>' + (data.ws_connections || 0) + '</span></div>';
+    html += '<div class="gw-stat"><span>Uptime</span><span>' + formatDuration(data.uptime_secs) + '</span></div>';
+
+    // Cost tracker
+    if (data.daily_cost != null) {
+      html += '<div class="gw-divider"></div>';
+      html += '<div class="gw-section-label">Cost Today</div>';
+      html += '<div class="gw-stat"><span>Spent</span><span>' + formatCost(data.daily_cost) + '</span></div>';
+      if (data.actions_this_hour != null) {
+        html += '<div class="gw-stat"><span>Actions/hr</span><span>' + data.actions_this_hour + '</span></div>';
+      }
+    }
+
+    // Per-model token usage
+    if (data.model_usage && data.model_usage.length > 0) {
+      html += '<div class="gw-divider"></div>';
+      html += '<div class="gw-section-label">Token Usage</div>';
+      data.model_usage.sort(function(a, b) {
+        return (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens);
+      });
+      for (var i = 0; i < data.model_usage.length; i++) {
+        var m = data.model_usage[i];
+        var name = escapeHtml(shortModelName(m.model));
+        html += '<div class="gw-model-row">'
+          + '<span class="gw-model-name">' + name + '</span>'
+          + '<span class="gw-model-cost">' + escapeHtml(formatCost(m.cost)) + '</span>'
+          + '</div>';
+        html += '<div class="gw-token-detail">'
+          + '<span>in: ' + formatTokenCount(m.input_tokens) + '</span>'
+          + '<span>out: ' + formatTokenCount(m.output_tokens) + '</span>'
+          + '</div>';
+      }
+    }
+
+    popover.innerHTML = html;
+  }).catch(function() {});
 }
 
 // Show/hide popover on hover
@@ -2065,33 +3474,481 @@ document.getElementById('gateway-status-trigger').addEventListener('mouseleave',
   document.getElementById('gateway-popover').classList.remove('visible');
 });
 
+// --- TEE attestation ---
+
+let teeInfo = null;
+let teeReportCache = null;
+let teeReportLoading = false;
+
+function teeApiBase() {
+  var parts = window.location.hostname.split('.');
+  if (parts.length < 2) return null;
+  var domain = parts.slice(1).join('.');
+  return window.location.protocol + '//api.' + domain;
+}
+
+function teeInstanceName() {
+  return window.location.hostname.split('.')[0];
+}
+
+function checkTeeStatus() {
+  var base = teeApiBase();
+  if (!base) return;
+  var name = teeInstanceName();
+  fetch(base + '/instances/' + encodeURIComponent(name) + '/attestation').then(function(res) {
+    if (!res.ok) throw new Error(res.status);
+    return res.json();
+  }).then(function(data) {
+    teeInfo = data;
+    document.getElementById('tee-shield').style.display = 'flex';
+  }).catch(function() {});
+}
+
+function fetchTeeReport() {
+  if (teeReportCache) {
+    renderTeePopover(teeReportCache);
+    return;
+  }
+  if (teeReportLoading) return;
+  teeReportLoading = true;
+  var base = teeApiBase();
+  if (!base) return;
+  var popover = document.getElementById('tee-popover');
+  popover.innerHTML = '<div class="tee-popover-loading">Loading attestation report...</div>';
+  fetch(base + '/attestation/report').then(function(res) {
+    if (!res.ok) throw new Error(res.status);
+    return res.json();
+  }).then(function(data) {
+    teeReportCache = data;
+    renderTeePopover(data);
+  }).catch(function() {
+    popover.innerHTML = '<div class="tee-popover-loading">Could not load attestation report</div>';
+  }).finally(function() {
+    teeReportLoading = false;
+  });
+}
+
+function renderTeePopover(report) {
+  var popover = document.getElementById('tee-popover');
+  var digest = (teeInfo && teeInfo.image_digest) || 'N/A';
+  var fingerprint = report.tls_certificate_fingerprint || 'N/A';
+  var reportData = report.report_data || '';
+  var vmConfig = report.vm_config || 'N/A';
+  var truncated = reportData.length > 32 ? reportData.slice(0, 32) + '...' : reportData;
+  popover.innerHTML = '<div class="tee-popover-title">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>'
+    + 'TEE Attestation</div>'
+    + '<div class="tee-field"><div class="tee-field-label">Image Digest</div>'
+    + '<div class="tee-field-value">' + escapeHtml(digest) + '</div></div>'
+    + '<div class="tee-field"><div class="tee-field-label">TLS Certificate Fingerprint</div>'
+    + '<div class="tee-field-value">' + escapeHtml(fingerprint) + '</div></div>'
+    + '<div class="tee-field"><div class="tee-field-label">Report Data</div>'
+    + '<div class="tee-field-value">' + escapeHtml(truncated) + '</div></div>'
+    + '<div class="tee-field"><div class="tee-field-label">VM Config</div>'
+    + '<div class="tee-field-value">' + escapeHtml(vmConfig) + '</div></div>'
+    + '<div class="tee-popover-actions">'
+    + '<button class="tee-btn-copy" onclick="copyTeeReport()">Copy Full Report</button></div>';
+}
+
+function copyTeeReport() {
+  if (!teeReportCache) return;
+  var combined = Object.assign({}, teeReportCache, teeInfo || {});
+  navigator.clipboard.writeText(JSON.stringify(combined, null, 2)).then(function() {
+    showToast('Attestation report copied', 'success');
+  }).catch(function() {
+    showToast('Failed to copy report', 'error');
+  });
+}
+
+document.getElementById('tee-shield').addEventListener('mouseenter', function() {
+  fetchTeeReport();
+  document.getElementById('tee-popover').classList.add('visible');
+});
+document.getElementById('tee-shield').addEventListener('mouseleave', function() {
+  document.getElementById('tee-popover').classList.remove('visible');
+});
+
 // --- Extension install ---
 
-function installExtension() {
-  const name = document.getElementById('ext-install-name').value.trim();
+function installWasmExtension() {
+  var name = document.getElementById('wasm-install-name').value.trim();
   if (!name) {
     showToast('Extension name is required', 'error');
     return;
   }
-  const url = document.getElementById('ext-install-url').value.trim();
-  const kind = document.getElementById('ext-install-kind').value;
+  var url = document.getElementById('wasm-install-url').value.trim();
+  if (!url) {
+    showToast('URL to .tar.gz bundle is required', 'error');
+    return;
+  }
 
   apiFetch('/api/extensions/install', {
     method: 'POST',
-    body: { name, url: url || undefined, kind },
-  }).then((res) => {
+    body: { name: name, url: url, kind: 'wasm_tool' },
+  }).then(function(res) {
     if (res.success) {
       showToast('Installed ' + name, 'success');
-      document.getElementById('ext-install-name').value = '';
-      document.getElementById('ext-install-url').value = '';
+      document.getElementById('wasm-install-name').value = '';
+      document.getElementById('wasm-install-url').value = '';
       loadExtensions();
     } else {
       showToast('Install failed: ' + (res.message || 'unknown error'), 'error');
     }
-  }).catch((err) => {
+  }).catch(function(err) {
     showToast('Install failed: ' + err.message, 'error');
   });
 }
+
+function addMcpServer() {
+  var name = document.getElementById('mcp-install-name').value.trim();
+  if (!name) {
+    showToast('Server name is required', 'error');
+    return;
+  }
+  var url = document.getElementById('mcp-install-url').value.trim();
+  if (!url) {
+    showToast('MCP server URL is required', 'error');
+    return;
+  }
+
+  apiFetch('/api/extensions/install', {
+    method: 'POST',
+    body: { name: name, url: url, kind: 'mcp_server' },
+  }).then(function(res) {
+    if (res.success) {
+      showToast('Added MCP server ' + name, 'success');
+      document.getElementById('mcp-install-name').value = '';
+      document.getElementById('mcp-install-url').value = '';
+      loadExtensions();
+    } else {
+      showToast('Failed to add MCP server: ' + (res.message || 'unknown error'), 'error');
+    }
+  }).catch(function(err) {
+    showToast('Failed to add MCP server: ' + err.message, 'error');
+  });
+}
+
+// --- Skills ---
+
+function loadSkills() {
+  var skillsList = document.getElementById('skills-list');
+  apiFetch('/api/skills').then(function(data) {
+    if (!data.skills || data.skills.length === 0) {
+      skillsList.innerHTML = '<div class="empty-state">No skills installed</div>';
+      return;
+    }
+    skillsList.innerHTML = '';
+    for (var i = 0; i < data.skills.length; i++) {
+      skillsList.appendChild(renderSkillCard(data.skills[i]));
+    }
+  }).catch(function(err) {
+    skillsList.innerHTML = '<div class="empty-state">Failed to load skills: ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+function renderSkillCard(skill) {
+  var card = document.createElement('div');
+  card.className = 'ext-card';
+
+  var header = document.createElement('div');
+  header.className = 'ext-header';
+
+  var name = document.createElement('span');
+  name.className = 'ext-name';
+  name.textContent = skill.name;
+  header.appendChild(name);
+
+  var trust = document.createElement('span');
+  var trustClass = skill.trust.toLowerCase() === 'trusted' ? 'trust-trusted' : 'trust-installed';
+  trust.className = 'skill-trust ' + trustClass;
+  trust.textContent = skill.trust;
+  header.appendChild(trust);
+
+  var version = document.createElement('span');
+  version.className = 'skill-version';
+  version.textContent = 'v' + skill.version;
+  header.appendChild(version);
+
+  card.appendChild(header);
+
+  var desc = document.createElement('div');
+  desc.className = 'ext-desc';
+  desc.textContent = skill.description;
+  card.appendChild(desc);
+
+  if (skill.keywords && skill.keywords.length > 0) {
+    var kw = document.createElement('div');
+    kw.className = 'ext-keywords';
+    kw.textContent = 'Activates on: ' + skill.keywords.join(', ');
+    card.appendChild(kw);
+  }
+
+  var actions = document.createElement('div');
+  actions.className = 'ext-actions';
+
+  // Only show Remove for registry-installed skills, not user-placed trusted skills
+  if (skill.trust.toLowerCase() !== 'trusted') {
+    var removeBtn = document.createElement('button');
+    removeBtn.className = 'btn-ext remove';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', function() { removeSkill(skill.name); });
+    actions.appendChild(removeBtn);
+  }
+
+  card.appendChild(actions);
+  return card;
+}
+
+function searchClawHub() {
+  var input = document.getElementById('skill-search-input');
+  var query = input.value.trim();
+  if (!query) return;
+
+  var resultsDiv = document.getElementById('skill-search-results');
+  resultsDiv.innerHTML = '<div class="empty-state">Searching...</div>';
+
+  apiFetch('/api/skills/search', {
+    method: 'POST',
+    body: { query: query },
+  }).then(function(data) {
+    resultsDiv.innerHTML = '';
+
+    // Show registry error as a warning banner if present
+    if (data.catalog_error) {
+      var warning = document.createElement('div');
+      warning.className = 'empty-state';
+      warning.style.color = '#f0ad4e';
+      warning.style.borderLeft = '3px solid #f0ad4e';
+      warning.style.paddingLeft = '12px';
+      warning.style.marginBottom = '16px';
+      warning.textContent = 'Could not reach ClawHub registry: ' + data.catalog_error;
+      resultsDiv.appendChild(warning);
+    }
+
+    // Show catalog results
+    if (data.catalog && data.catalog.length > 0) {
+      // Build a set of installed skill names for quick lookup
+      var installedNames = {};
+      if (data.installed) {
+        for (var j = 0; j < data.installed.length; j++) {
+          installedNames[data.installed[j].name] = true;
+        }
+      }
+
+      for (var i = 0; i < data.catalog.length; i++) {
+        var card = renderCatalogSkillCard(data.catalog[i], installedNames);
+        card.style.animationDelay = (i * 0.06) + 's';
+        resultsDiv.appendChild(card);
+      }
+    }
+
+    // Show matching installed skills too
+    if (data.installed && data.installed.length > 0) {
+      for (var k = 0; k < data.installed.length; k++) {
+        var installedCard = renderSkillCard(data.installed[k]);
+        installedCard.style.animationDelay = ((data.catalog ? data.catalog.length : 0) + k) * 0.06 + 's';
+        installedCard.classList.add('skill-search-result');
+        resultsDiv.appendChild(installedCard);
+      }
+    }
+
+    if (resultsDiv.children.length === 0) {
+      resultsDiv.innerHTML = '<div class="empty-state">No skills found for "' + escapeHtml(query) + '"</div>';
+    }
+  }).catch(function(err) {
+    resultsDiv.innerHTML = '<div class="empty-state">Search failed: ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+function renderCatalogSkillCard(entry, installedNames) {
+  var card = document.createElement('div');
+  card.className = 'ext-card ext-available skill-search-result';
+
+  var header = document.createElement('div');
+  header.className = 'ext-header';
+
+  var name = document.createElement('a');
+  name.className = 'ext-name';
+  name.textContent = entry.name || entry.slug;
+  name.href = 'https://clawhub.ai/skills/' + encodeURIComponent(entry.slug);
+  name.target = '_blank';
+  name.rel = 'noopener';
+  name.style.textDecoration = 'none';
+  name.style.color = 'inherit';
+  name.title = 'View on ClawHub';
+  header.appendChild(name);
+
+  if (entry.version) {
+    var version = document.createElement('span');
+    version.className = 'skill-version';
+    version.textContent = 'v' + entry.version;
+    header.appendChild(version);
+  }
+
+  card.appendChild(header);
+
+  if (entry.description) {
+    var desc = document.createElement('div');
+    desc.className = 'ext-desc';
+    desc.textContent = entry.description;
+    card.appendChild(desc);
+  }
+
+  // Metadata row: owner, stars, downloads, recency
+  var meta = document.createElement('div');
+  meta.className = 'ext-meta';
+  meta.style.fontSize = '11px';
+  meta.style.color = '#888';
+  meta.style.marginTop = '6px';
+
+  function addMetaSep() {
+    if (meta.children.length > 0) {
+      meta.appendChild(document.createTextNode(' \u00b7 '));
+    }
+  }
+
+  if (entry.owner) {
+    var ownerSpan = document.createElement('span');
+    ownerSpan.textContent = 'by ' + entry.owner;
+    meta.appendChild(ownerSpan);
+  }
+
+  if (entry.stars != null) {
+    addMetaSep();
+    var starsSpan = document.createElement('span');
+    starsSpan.textContent = entry.stars + ' stars';
+    meta.appendChild(starsSpan);
+  }
+
+  if (entry.downloads != null) {
+    addMetaSep();
+    var dlSpan = document.createElement('span');
+    dlSpan.textContent = formatCompactNumber(entry.downloads) + ' downloads';
+    meta.appendChild(dlSpan);
+  }
+
+  if (entry.updatedAt) {
+    var ago = formatTimeAgo(entry.updatedAt);
+    if (ago) {
+      addMetaSep();
+      var updatedSpan = document.createElement('span');
+      updatedSpan.textContent = 'updated ' + ago;
+      meta.appendChild(updatedSpan);
+    }
+  }
+
+  if (meta.children.length > 0) {
+    card.appendChild(meta);
+  }
+
+  var actions = document.createElement('div');
+  actions.className = 'ext-actions';
+
+  var slug = entry.slug || entry.name;
+  var isInstalled = installedNames[entry.name] || installedNames[slug];
+
+  if (isInstalled) {
+    var label = document.createElement('span');
+    label.className = 'ext-active-label';
+    label.textContent = 'Installed';
+    actions.appendChild(label);
+  } else {
+    var installBtn = document.createElement('button');
+    installBtn.className = 'btn-ext install';
+    installBtn.textContent = 'Install';
+    installBtn.addEventListener('click', (function(s, btn) {
+      return function() {
+        if (!confirm('Install skill "' + s + '" from ClawHub?')) return;
+        btn.disabled = true;
+        btn.textContent = 'Installing...';
+        installSkill(s, null, btn);
+      };
+    })(slug, installBtn));
+    actions.appendChild(installBtn);
+  }
+
+  card.appendChild(actions);
+  return card;
+}
+
+function formatCompactNumber(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return '' + n;
+}
+
+function formatTimeAgo(epochMs) {
+  var now = Date.now();
+  var diff = now - epochMs;
+  if (diff < 0) return null;
+  var minutes = Math.floor(diff / 60000);
+  if (minutes < 60) return minutes <= 1 ? 'just now' : minutes + 'm ago';
+  var hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + 'h ago';
+  var days = Math.floor(hours / 24);
+  if (days < 30) return days + 'd ago';
+  var months = Math.floor(days / 30);
+  if (months < 12) return months + 'mo ago';
+  return Math.floor(months / 12) + 'y ago';
+}
+
+function installSkill(nameOrSlug, url, btn) {
+  var body = { name: nameOrSlug, slug: nameOrSlug };
+  if (url) body.url = url;
+
+  apiFetch('/api/skills/install', {
+    method: 'POST',
+    headers: { 'X-Confirm-Action': 'true' },
+    body: body,
+  }).then(function(res) {
+    if (res.success) {
+      showToast('Installed skill "' + nameOrSlug + '"', 'success');
+    } else {
+      showToast('Install failed: ' + (res.message || 'unknown error'), 'error');
+    }
+    loadSkills();
+    if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+  }).catch(function(err) {
+    showToast('Install failed: ' + err.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+  });
+}
+
+function removeSkill(name) {
+  if (!confirm('Remove skill "' + name + '"?')) return;
+  apiFetch('/api/skills/' + encodeURIComponent(name), {
+    method: 'DELETE',
+    headers: { 'X-Confirm-Action': 'true' },
+  }).then(function(res) {
+    if (res.success) {
+      showToast('Removed skill "' + name + '"', 'success');
+    } else {
+      showToast('Remove failed: ' + (res.message || 'unknown error'), 'error');
+    }
+    loadSkills();
+  }).catch(function(err) {
+    showToast('Remove failed: ' + err.message, 'error');
+  });
+}
+
+function installSkillFromForm() {
+  var name = document.getElementById('skill-install-name').value.trim();
+  if (!name) { showToast('Skill name is required', 'error'); return; }
+  var url = document.getElementById('skill-install-url').value.trim() || null;
+  if (url && !url.startsWith('https://')) {
+    showToast('URL must use HTTPS', 'error');
+    return;
+  }
+  if (!confirm('Install skill "' + name + '"?')) return;
+  installSkill(name, url, null);
+  document.getElementById('skill-install-name').value = '';
+  document.getElementById('skill-install-url').value = '';
+}
+
+// Wire up Enter key on search input
+document.getElementById('skill-search-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') searchClawHub();
+});
 
 // --- Keyboard shortcuts ---
 
@@ -2103,7 +3960,7 @@ document.addEventListener('keydown', (e) => {
   // Mod+1-6: switch tabs
   if (mod && e.key >= '1' && e.key <= '6') {
     e.preventDefault();
-    const tabs = ['chat', 'memory', 'jobs', 'routines', 'logs', 'extensions'];
+    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills'];
     const idx = parseInt(e.key) - 1;
     if (tabs[idx]) switchTab(tabs[idx]);
     return;
@@ -2127,8 +3984,13 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Escape: close job detail or blur input
+  // Escape: close autocomplete, job detail, or blur input
   if (e.key === 'Escape') {
+    const acEl = document.getElementById('slash-autocomplete');
+    if (acEl && acEl.style.display !== 'none') {
+      hideSlashAutocomplete();
+      return;
+    }
     if (currentJobId) {
       closeJobDetail();
     } else if (inInput) {

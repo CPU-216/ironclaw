@@ -18,7 +18,7 @@ use crate::tools::mcp::protocol::{
     CallToolResult, InitializeResult, ListToolsResult, McpRequest, McpResponse, McpTool,
 };
 use crate::tools::mcp::session::McpSessionManager;
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
 /// MCP client for communicating with MCP servers.
 ///
@@ -261,9 +261,9 @@ impl McpClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            let preview = sanitize_error_body(&body);
             return Err(ToolError::ExternalService(format!(
-                "MCP server returned status: {} - {}",
-                status, body
+                "MCP server returned status: {status} - {preview}",
             )));
         }
 
@@ -538,9 +538,65 @@ impl Tool for McpToolWrapper {
         true // MCP tools are external, always sanitize
     }
 
-    fn requires_approval(&self) -> bool {
-        // Check the destructive_hint annotation from the MCP server
-        self.tool.requires_approval()
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        // Delegate to the MCP protocol type's own requires_approval() bool method
+        if self.tool.requires_approval() {
+            ApprovalRequirement::UnlessAutoApproved
+        } else {
+            ApprovalRequirement::Never
+        }
+    }
+}
+
+/// Sanitize an HTTP error response body for safe display.
+///
+/// Detects full HTML error pages (containing `<html` or `<!DOCTYPE`) and
+/// strips all tags, collapsing whitespace.  Non-HTML bodies are left
+/// intact.  In both cases the result is truncated to 200 *characters*
+/// (char-boundary safe) so that large payloads don't bloat error messages.
+///
+/// See #263 — raw HTML error pages were propagating through the error
+/// chain into the web UI, causing a white screen.
+fn sanitize_error_body(body: &str) -> String {
+    const MAX_CHARS: usize = 200;
+
+    // Only strip tags when the body looks like a full HTML document.
+    // Plain text that happens to contain `<` / `>` (e.g. log lines,
+    // comparison expressions) is left untouched.
+    let lower = body.to_ascii_lowercase();
+    let is_html_document = lower.contains("<html") || lower.contains("<!doctype");
+
+    let text = if is_html_document {
+        let stripped = body
+            .chars()
+            .fold((String::new(), false), |(mut out, in_tag), c| {
+                if c == '<' {
+                    (out, true)
+                } else if c == '>' {
+                    (out, false)
+                } else if !in_tag {
+                    out.push(c);
+                    (out, false)
+                } else {
+                    (out, true)
+                }
+            })
+            .0;
+        stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        body.to_string()
+    };
+
+    // Truncate at a char boundary (safe for multi-byte UTF-8).
+    if text.chars().count() > MAX_CHARS {
+        let byte_offset = text
+            .char_indices()
+            .nth(MAX_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        format!("{}... ({} bytes total)", &text[..byte_offset], body.len())
+    } else {
+        text
     }
 }
 
@@ -578,5 +634,231 @@ mod tests {
         assert_eq!(client.server_url(), "http://localhost:8080");
         assert!(client.session_manager.is_none());
         assert!(client.secrets.is_none());
+    }
+
+    #[test]
+    fn test_extract_server_name_with_port() {
+        assert_eq!(
+            extract_server_name("http://example.com:3000"),
+            "example_com"
+        );
+    }
+
+    #[test]
+    fn test_extract_server_name_with_path() {
+        assert_eq!(
+            extract_server_name("http://api.server.io/v2/mcp"),
+            "api_server_io"
+        );
+    }
+
+    #[test]
+    fn test_extract_server_name_with_query_params() {
+        assert_eq!(
+            extract_server_name("http://mcp.example.com/endpoint?token=abc&v=1"),
+            "mcp_example_com"
+        );
+    }
+
+    #[test]
+    fn test_extract_server_name_https() {
+        assert_eq!(
+            extract_server_name("https://secure.mcp.dev"),
+            "secure_mcp_dev"
+        );
+    }
+
+    #[test]
+    fn test_extract_server_name_ip_address() {
+        assert_eq!(
+            extract_server_name("http://192.168.1.100:9090/mcp"),
+            "192_168_1_100"
+        );
+    }
+
+    #[test]
+    fn test_new_defaults() {
+        let client = McpClient::new("http://localhost:9999");
+        assert_eq!(client.server_url(), "http://localhost:9999");
+        assert_eq!(client.server_name(), "localhost");
+        assert!(client.session_manager.is_none());
+        assert!(client.secrets.is_none());
+        assert_eq!(client.user_id, "default");
+    }
+
+    #[test]
+    fn test_new_with_name_uses_custom_name() {
+        let client = McpClient::new_with_name("my-server", "http://localhost:8080");
+        assert_eq!(client.server_name(), "my-server");
+        assert_eq!(client.server_url(), "http://localhost:8080");
+        assert_eq!(client.user_id, "default");
+        assert!(client.session_manager.is_none());
+        assert!(client.secrets.is_none());
+    }
+
+    #[test]
+    fn test_server_name_accessor() {
+        let client = McpClient::new("https://tools.example.org/mcp");
+        assert_eq!(client.server_name(), "tools_example_org");
+    }
+
+    #[test]
+    fn test_server_url_accessor() {
+        let url = "https://tools.example.org/mcp?v=2";
+        let client = McpClient::new(url);
+        assert_eq!(client.server_url(), url);
+    }
+
+    #[test]
+    fn test_clone_preserves_fields() {
+        let client = McpClient::new_with_name("cloned-server", "http://localhost:5555");
+        // Bump the request ID a few times
+        client.next_request_id();
+        client.next_request_id();
+
+        let cloned = client.clone();
+        assert_eq!(cloned.server_url(), "http://localhost:5555");
+        assert_eq!(cloned.server_name(), "cloned-server");
+        assert_eq!(cloned.user_id, "default");
+        // The atomic counter value is copied
+        assert_eq!(cloned.next_id.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_clone_resets_tools_cache() {
+        let client = McpClient::new("http://localhost:5555");
+        // The clone implementation resets tools_cache to None
+        let cloned = client.clone();
+        let cache = cloned.tools_cache.read().await;
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn test_next_request_id_monotonically_increasing() {
+        let client = McpClient::new("http://localhost:1234");
+        let id1 = client.next_request_id();
+        let id2 = client.next_request_id();
+        let id3 = client.next_request_id();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn test_mcp_tool_requires_approval_destructive() {
+        use crate::tools::mcp::protocol::{McpTool, McpToolAnnotations};
+
+        let tool = McpTool {
+            name: "delete_all".to_string(),
+            description: "Deletes everything".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: Some(McpToolAnnotations {
+                destructive_hint: true,
+                side_effects_hint: false,
+                read_only_hint: false,
+                execution_time_hint: None,
+            }),
+        };
+        assert!(tool.requires_approval());
+    }
+
+    #[test]
+    fn test_mcp_tool_no_approval_when_not_destructive() {
+        use crate::tools::mcp::protocol::{McpTool, McpToolAnnotations};
+
+        let tool = McpTool {
+            name: "read_data".to_string(),
+            description: "Reads data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: Some(McpToolAnnotations {
+                destructive_hint: false,
+                side_effects_hint: true,
+                read_only_hint: false,
+                execution_time_hint: None,
+            }),
+        };
+        assert!(!tool.requires_approval());
+    }
+
+    #[test]
+    fn test_mcp_tool_no_approval_when_no_annotations() {
+        use crate::tools::mcp::protocol::McpTool;
+
+        let tool = McpTool {
+            name: "simple_tool".to_string(),
+            description: "A simple tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        };
+        assert!(!tool.requires_approval());
+    }
+
+    // Regression tests for #263: HTML error bodies must not propagate raw
+    // markup through the error chain into the web UI.
+
+    #[test]
+    fn test_sanitize_error_body_strips_html_tags() {
+        let html =
+            r#"<!DOCTYPE html><html><body><h1>422 Error</h1><p>Invalid token</p></body></html>"#;
+        let result = sanitize_error_body(html);
+        assert!(!result.contains('<'), "HTML tags must be stripped");
+        assert!(!result.contains('>'), "HTML tags must be stripped");
+        assert!(result.contains("422 Error"));
+        assert!(result.contains("Invalid token"));
+    }
+
+    #[test]
+    fn test_sanitize_error_body_truncates_large_html_page() {
+        let html = format!(
+            "<html><body><p>{}</p></body></html>",
+            "error detail ".repeat(50)
+        );
+        let result = sanitize_error_body(&html);
+        assert!(result.contains("..."));
+        assert!(result.contains("bytes total)"));
+        assert!(!result.contains('<'));
+    }
+
+    #[test]
+    fn test_sanitize_error_body_passes_short_plain_text() {
+        assert_eq!(sanitize_error_body("Not Found"), "Not Found");
+    }
+
+    #[test]
+    fn test_sanitize_error_body_truncates_long_plain_text() {
+        let long = "x".repeat(300);
+        let result = sanitize_error_body(&long);
+        assert!(result.contains("..."));
+        assert!(result.contains("300 bytes total)"));
+    }
+
+    #[test]
+    fn test_sanitize_error_body_multibyte_no_panic() {
+        // 300 CJK characters = 900 bytes; truncation must land on a
+        // char boundary, not in the middle of a multi-byte sequence.
+        let cjk = "错误".repeat(150);
+        let result = sanitize_error_body(&cjk);
+        assert!(result.contains("..."));
+        // Must be valid UTF-8 (would have panicked otherwise).
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn test_sanitize_error_body_strips_uppercase_html() {
+        let html = "<HTML><BODY><H1>500 Internal Server Error</H1></BODY></HTML>";
+        let result = sanitize_error_body(html);
+        assert!(
+            !result.contains('<'),
+            "uppercase HTML tags must be stripped"
+        );
+        assert!(result.contains("500 Internal Server Error"));
+    }
+
+    #[test]
+    fn test_sanitize_error_body_preserves_angle_brackets_in_non_html() {
+        // Text with < and > that is NOT an HTML document should be
+        // left untouched (e.g. log lines, comparison expressions).
+        let text = "value < 10 and value > 0";
+        assert_eq!(sanitize_error_body(text), text);
     }
 }

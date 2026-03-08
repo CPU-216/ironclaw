@@ -11,6 +11,7 @@
 //! - Context compaction for long conversations
 
 mod agent_loop;
+mod attachments;
 mod commands;
 pub mod compaction;
 pub mod context_monitor;
@@ -44,6 +45,6 @@ pub use self_repair::{BrokenTool, RepairResult, RepairTask, SelfRepair, StuckJob
 pub use session::{PendingApproval, PendingAuth, Session, Thread, ThreadState, Turn, TurnState};
 pub use session_manager::SessionManager;
 pub use submission::{Submission, SubmissionParser, SubmissionResult};
-pub use task::{Task, TaskContext, TaskHandler, TaskOutput, TaskStatus};
+pub use task::{Task, TaskContext, TaskHandler, TaskOutput};
 pub use undo::{Checkpoint, UndoManager};
 pub use worker::{Worker, WorkerDeps};

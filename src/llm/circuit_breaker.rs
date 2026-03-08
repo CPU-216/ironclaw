@@ -123,7 +123,11 @@ impl CircuitBreakerProvider {
                         );
                         Ok(())
                     } else {
-                        let remaining = self.config.recovery_timeout - opened_at.elapsed();
+                        let remaining = self
+                            .config
+                            .recovery_timeout
+                            .checked_sub(opened_at.elapsed())
+                            .unwrap_or(Duration::ZERO);
                         Err(LlmError::RequestFailed {
                             provider: self.inner.model_name().to_string(),
                             reason: format!(
@@ -208,8 +212,16 @@ impl CircuitBreakerProvider {
 /// Returns `true` for errors that indicate the provider is degraded
 /// (server errors, rate limits, network failures, auth infrastructure down).
 ///
-/// Client errors (wrong model, bad credentials, context overflow) are NOT
-/// transient: they are the caller's problem, not a sign of backend trouble.
+/// This answers: "should this error count toward tripping the circuit breaker?"
+///
+/// Includes `SessionExpired` because repeated session failures signal backend
+/// auth infrastructure trouble.
+///
+/// Excludes client errors that are the caller's problem, not backend trouble:
+/// `AuthFailed`, `ContextLengthExceeded`, `ModelNotAvailable`, `Json`.
+///
+/// See also `retry::is_retryable()` which answers a different question:
+/// "could retrying this exact request succeed?"
 fn is_transient(err: &LlmError) -> bool {
     matches!(
         err,
@@ -219,7 +231,6 @@ fn is_transient(err: &LlmError) -> bool {
             | LlmError::SessionExpired { .. }
             | LlmError::SessionRenewalFailed { .. }
             | LlmError::Http(_)
-            | LlmError::Json(_)
             | LlmError::Io(_)
     )
 }
@@ -232,6 +243,14 @@ impl LlmProvider for CircuitBreakerProvider {
 
     fn cost_per_token(&self) -> (Decimal, Decimal) {
         self.inner.cost_per_token()
+    }
+
+    fn cache_write_multiplier(&self) -> Decimal {
+        self.inner.cache_write_multiplier()
+    }
+
+    fn cache_read_discount(&self) -> Decimal {
+        self.inner.cache_read_discount()
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
@@ -273,20 +292,16 @@ impl LlmProvider for CircuitBreakerProvider {
         self.inner.model_metadata().await
     }
 
+    fn effective_model_name(&self, requested_model: Option<&str>) -> String {
+        self.inner.effective_model_name(requested_model)
+    }
+
     fn active_model_name(&self) -> String {
         self.inner.active_model_name()
     }
 
     fn set_model(&self, model: &str) -> Result<(), LlmError> {
         self.inner.set_model(model)
-    }
-
-    fn seed_response_chain(&self, thread_id: &str, response_id: String) {
-        self.inner.seed_response_chain(thread_id, response_id)
-    }
-
-    fn get_response_chain_id(&self, thread_id: &str) -> Option<String> {
-        self.inner.get_response_chain_id(thread_id)
     }
 
     fn calculate_cost(&self, input_tokens: u32, output_tokens: u32) -> Decimal {
@@ -298,121 +313,7 @@ impl LlmProvider for CircuitBreakerProvider {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use crate::llm::provider::{CompletionResponse, FinishReason, ToolCompletionResponse};
-
-    /// A test stub that either always succeeds or always fails with a
-    /// configurable error. The `should_fail` flag can be flipped at
-    /// runtime for half-open recovery tests.
-    struct StubProvider {
-        name: String,
-        should_fail: AtomicBool,
-        error_kind: StubError,
-    }
-
-    #[derive(Clone)]
-    enum StubError {
-        Transient,
-        NonTransient,
-    }
-
-    impl StubProvider {
-        fn always_ok(name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                name: name.to_string(),
-                should_fail: AtomicBool::new(false),
-                error_kind: StubError::Transient,
-            })
-        }
-
-        fn always_fail(name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                name: name.to_string(),
-                should_fail: AtomicBool::new(true),
-                error_kind: StubError::Transient,
-            })
-        }
-
-        fn always_fail_non_transient(name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                name: name.to_string(),
-                should_fail: AtomicBool::new(true),
-                error_kind: StubError::NonTransient,
-            })
-        }
-
-        fn set_failing(&self, fail: bool) {
-            self.should_fail.store(fail, Ordering::Relaxed);
-        }
-
-        fn make_error(&self) -> LlmError {
-            match self.error_kind {
-                StubError::Transient => LlmError::RequestFailed {
-                    provider: self.name.clone(),
-                    reason: "server error".to_string(),
-                },
-                StubError::NonTransient => LlmError::ContextLengthExceeded {
-                    used: 100_000,
-                    limit: 50_000,
-                },
-            }
-        }
-
-        fn ok_response() -> CompletionResponse {
-            CompletionResponse {
-                content: "ok".to_string(),
-                input_tokens: 10,
-                output_tokens: 5,
-                finish_reason: FinishReason::Stop,
-                response_id: None,
-            }
-        }
-
-        fn ok_tool_response() -> ToolCompletionResponse {
-            ToolCompletionResponse {
-                content: Some("ok".to_string()),
-                tool_calls: vec![],
-                input_tokens: 10,
-                output_tokens: 5,
-                finish_reason: FinishReason::Stop,
-                response_id: None,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for StubProvider {
-        fn model_name(&self) -> &str {
-            &self.name
-        }
-
-        fn cost_per_token(&self) -> (Decimal, Decimal) {
-            (Decimal::ZERO, Decimal::ZERO)
-        }
-
-        async fn complete(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
-            if self.should_fail.load(Ordering::Relaxed) {
-                Err(self.make_error())
-            } else {
-                Ok(Self::ok_response())
-            }
-        }
-
-        async fn complete_with_tools(
-            &self,
-            _request: ToolCompletionRequest,
-        ) -> Result<ToolCompletionResponse, LlmError> {
-            if self.should_fail.load(Ordering::Relaxed) {
-                Err(self.make_error())
-            } else {
-                Ok(Self::ok_tool_response())
-            }
-        }
-    }
+    use crate::testing::StubLlm;
 
     fn make_request() -> CompletionRequest {
         CompletionRequest::new(vec![crate::llm::ChatMessage::user("hello")])
@@ -434,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_allows_calls_and_resets_on_success() {
-        let stub = StubProvider::always_ok("test");
+        let stub = Arc::new(StubLlm::new("ok").with_model_name("test"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(3));
 
         let resp = cb.complete(make_request()).await;
@@ -445,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn failures_accumulate_then_trip_to_open() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(3));
 
         // First 2 failures: still closed
@@ -462,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_rejects_immediately() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(
             stub,
             CircuitBreakerConfig {
@@ -492,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_timeout_transitions_to_half_open() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(1));
 
         // Trip to open
@@ -510,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn half_open_success_closes_circuit() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(stub.clone(), fast_config(1));
 
         // Trip to open
@@ -530,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn half_open_failure_reopens_circuit() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(1));
 
         // Trip to open
@@ -546,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_transient_errors_do_not_trip_breaker() {
-        let stub = StubProvider::always_fail_non_transient("test");
+        let stub = Arc::new(StubLlm::failing_non_transient("test"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(1));
 
         // ContextLengthExceeded is not transient; breaker should stay closed
@@ -559,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn success_resets_failure_count() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(stub.clone(), fast_config(3));
 
         // Accumulate 2 failures
@@ -576,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_with_tools_uses_same_breaker_logic() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(2));
 
         let _ = cb.complete_with_tools(make_tool_request()).await;
@@ -586,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_half_open_successes_needed() {
-        let stub = StubProvider::always_fail("test");
+        let stub = Arc::new(StubLlm::failing("test"));
         let cb = CircuitBreakerProvider::new(
             stub.clone(),
             CircuitBreakerConfig {
@@ -657,18 +558,222 @@ mod tests {
             provider: "p".into(),
             model: "m".into(),
         }));
+        assert!(!is_transient(&LlmError::Json(
+            serde_json::from_str::<String>("bad").unwrap_err()
+        )));
     }
 
     // -- Passthrough delegation tests --
 
     #[tokio::test]
     async fn passthrough_methods_delegate_to_inner() {
-        let stub = StubProvider::always_ok("my-model");
+        let stub = Arc::new(StubLlm::new("ok").with_model_name("my-model"));
         let cb = CircuitBreakerProvider::new(stub, fast_config(3));
 
         assert_eq!(cb.model_name(), "my-model");
         assert_eq!(cb.active_model_name(), "my-model");
         assert_eq!(cb.cost_per_token(), (Decimal::ZERO, Decimal::ZERO));
         assert_eq!(cb.calculate_cost(100, 50), Decimal::ZERO);
+    }
+
+    // === QA Plan P2 - 4.1: Provider chaos tests ===
+
+    /// Provider that hangs forever (tests timeout handling at the caller).
+    struct HangingProvider;
+
+    #[async_trait]
+    impl LlmProvider for HangingProvider {
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            // Hang forever
+            std::future::pending().await
+        }
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_provider_behind_breaker_can_be_timed_out() {
+        let hanging: Arc<dyn LlmProvider> = Arc::new(HangingProvider);
+        let cb = CircuitBreakerProvider::new(hanging, fast_config(1));
+
+        // The caller should be able to timeout the request.
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), cb.complete(make_request())).await;
+
+        // Should timeout, not hang forever.
+        assert!(result.is_err(), "should timeout, not hang");
+    }
+
+    #[tokio::test]
+    async fn rapid_open_close_cycles_do_not_corrupt_state() {
+        let stub = Arc::new(StubLlm::failing("test"));
+        let cb = CircuitBreakerProvider::new(
+            stub.clone(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_timeout: Duration::from_millis(10),
+                half_open_successes_needed: 1,
+            },
+        );
+
+        // Cycle through open/half-open/open several times.
+        for _ in 0..5 {
+            // Trip to open.
+            let _ = cb.complete(make_request()).await;
+            assert_eq!(cb.circuit_state().await, CircuitState::Open);
+
+            // Wait for recovery.
+            tokio::time::sleep(Duration::from_millis(15)).await;
+
+            // Probe fails (stub still failing) → back to Open.
+            let _ = cb.complete(make_request()).await;
+            assert_eq!(cb.circuit_state().await, CircuitState::Open);
+        }
+
+        // Now flip to succeeding and verify recovery still works.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        stub.set_failing(false);
+        let result = cb.complete(make_request()).await;
+        assert!(result.is_ok());
+        assert_eq!(cb.circuit_state().await, CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn mixed_error_types_only_transient_counts() {
+        // Non-transient errors should never trip the breaker, even after many attempts.
+        let non_transient = Arc::new(StubLlm::failing_non_transient("test"));
+        let cb_nt = CircuitBreakerProvider::new(non_transient, fast_config(3));
+
+        // 100 non-transient errors should not trip the breaker.
+        for _ in 0..100 {
+            let _ = cb_nt.complete(make_request()).await;
+        }
+        assert_eq!(cb_nt.circuit_state().await, CircuitState::Closed);
+        assert_eq!(cb_nt.consecutive_failures().await, 0);
+    }
+
+    // === QA Plan 2.6: Edge case tests ===
+
+    /// With a recovery_timeout of zero, the circuit should transition from
+    /// Open to HalfOpen immediately on the next call (the elapsed time
+    /// always >= Duration::ZERO). This verifies that zero-duration timeouts
+    /// are not treated as a special "disabled" sentinel.
+    #[tokio::test]
+    async fn test_cooldown_at_zero_nanos() {
+        let stub = Arc::new(StubLlm::failing("test"));
+        let cb = CircuitBreakerProvider::new(
+            stub.clone(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_timeout: Duration::ZERO,
+                half_open_successes_needed: 1,
+            },
+        );
+
+        // Trip the breaker with one failure.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(cb.circuit_state().await, CircuitState::Open);
+
+        // With recovery_timeout = 0, the very next call should transition
+        // from Open -> HalfOpen immediately (no sleep needed).
+        // Since the stub is still failing, the probe will fail, sending
+        // it back to Open. But the key assertion is that the transition
+        // to HalfOpen actually happened (not stuck in Open forever).
+        stub.set_failing(false);
+        let result = cb.complete(make_request()).await;
+        assert!(
+            result.is_ok(),
+            "zero recovery_timeout should allow immediate probe"
+        );
+        assert_eq!(
+            cb.circuit_state().await,
+            CircuitState::Closed,
+            "successful probe after zero-timeout should close the circuit"
+        );
+
+        // Verify it also works when the probe fails: should re-open, not
+        // get stuck in some intermediate state.
+        stub.set_failing(true);
+        // Trip again.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(cb.circuit_state().await, CircuitState::Open);
+        // Next call: Open -> HalfOpen (zero timeout), probe fails -> Open.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(
+            cb.circuit_state().await,
+            CircuitState::Open,
+            "failed probe should re-open circuit even with zero timeout"
+        );
+    }
+
+    /// When in half-open state, a single failure should immediately
+    /// re-open the circuit (not close it or leave it in half-open).
+    /// Also verifies that any accumulated half_open_successes are reset.
+    #[tokio::test]
+    async fn test_circuit_breaker_half_open_failure_reopens() {
+        let stub = Arc::new(StubLlm::failing("test"));
+        let cb = CircuitBreakerProvider::new(
+            stub.clone(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_timeout: Duration::from_millis(20),
+                half_open_successes_needed: 3, // require multiple successes
+            },
+        );
+
+        // Trip the breaker.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(cb.circuit_state().await, CircuitState::Open);
+
+        // Wait for recovery, then succeed once to accumulate 1 half-open success.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stub.set_failing(false);
+        let _ = cb.complete(make_request()).await;
+        // Still in half-open (need 3 successes, got 1).
+        assert_eq!(cb.circuit_state().await, CircuitState::HalfOpen);
+
+        // Now fail: should immediately re-open, discarding the 1 accumulated success.
+        stub.set_failing(true);
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(
+            cb.circuit_state().await,
+            CircuitState::Open,
+            "failure in half-open should immediately re-open the circuit"
+        );
+
+        // After re-opening, wait for recovery and verify that the half-open
+        // success counter was reset (need 3 fresh successes, not 2).
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stub.set_failing(false);
+
+        // First success: half-open, count=1.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(cb.circuit_state().await, CircuitState::HalfOpen);
+
+        // Second success: half-open, count=2.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(cb.circuit_state().await, CircuitState::HalfOpen);
+
+        // Third success: closes the circuit.
+        let _ = cb.complete(make_request()).await;
+        assert_eq!(
+            cb.circuit_state().await,
+            CircuitState::Closed,
+            "3 fresh successes needed after re-open, not 2"
+        );
+        assert_eq!(cb.consecutive_failures().await, 0);
     }
 }

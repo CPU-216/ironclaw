@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use ironclaw::db::Database;
-use ironclaw::db::libsql_backend::LibSqlBackend;
+use ironclaw::db::libsql::LibSqlBackend;
 use ironclaw::workspace::{LanceDbVectorStore, SearchConfig, Workspace};
 use tempfile::TempDir;
 
