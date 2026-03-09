@@ -164,6 +164,8 @@ pub struct GatewayState {
     pub scheduler: Option<crate::tools::builtin::SchedulerSlot>,
     /// Rate limiter for chat endpoints (30 messages per 60 seconds).
     pub chat_rate_limiter: RateLimiter,
+    /// Rate limiter for webhook trigger endpoints (10 requests per 60 seconds).
+    pub webhook_rate_limiter: RateLimiter,
     /// Registry catalog entries for the available extensions API.
     /// Populated at startup from `registry/` manifests, independent of extension manager.
     pub registry_entries: Vec<crate::extensions::RegistryEntry>,
@@ -2464,6 +2466,7 @@ mod tests {
             skill_catalog: None,
             scheduler: None,
             chat_rate_limiter: RateLimiter::new(30, 60),
+            webhook_rate_limiter: RateLimiter::new(10, 60),
             registry_entries: vec![],
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),

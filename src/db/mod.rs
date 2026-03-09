@@ -303,6 +303,10 @@ pub trait RoutineStore: Send + Sync {
         run_id: Uuid,
         job_id: Uuid,
     ) -> Result<(), DatabaseError>;
+    async fn get_webhook_routine_by_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<Routine>, DatabaseError>;
 }
 
 #[async_trait]
