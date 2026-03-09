@@ -401,12 +401,16 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Add HTTP channel if configured and not CLI-only mode.
     let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
+    #[cfg(unix)]
     let mut http_channel_state: Option<Arc<ironclaw::channels::HttpChannelState>> = None;
     if !cli.cli_only
         && let Some(ref http_config) = config.channels.http
     {
         let http_channel = HttpChannel::new(http_config.clone());
-        http_channel_state = Some(http_channel.shared_state());
+        #[cfg(unix)]
+        {
+            http_channel_state = Some(http_channel.shared_state());
+        }
         webhook_routes.push(http_channel.routes());
         let (host, port) = http_channel.addr();
         webhook_server_addr = Some(
@@ -684,7 +688,8 @@ async fn async_main() -> anyhow::Result<()> {
     // Clone context_manager for the reaper before it's moved into Agent::new()
     let reaper_context_manager = Arc::clone(&components.context_manager);
 
-    // Capture db reference for SIGHUP handler before it's moved into AgentDeps
+    // Capture db reference for SIGHUP handler before it's moved into AgentDeps (Unix only)
+    #[cfg(unix)]
     let sighup_settings_store: Option<Arc<dyn ironclaw::db::SettingsStore>> = components
         .db
         .as_ref()
