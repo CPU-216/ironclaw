@@ -609,7 +609,9 @@ mod tests {
         );
 
         // Update secret to new-secret
-        channel.update_secret(Some(SecretString::from("new-secret".to_string()))).await;
+        channel
+            .update_secret(Some(SecretString::from("new-secret".to_string())))
+            .await;
 
         let app2 = channel.routes();
 
@@ -650,8 +652,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_requests_during_secret_update() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         let channel = test_channel(Some("initial-secret"));
