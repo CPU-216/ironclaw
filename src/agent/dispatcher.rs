@@ -510,6 +510,39 @@ impl Agent {
                             };
 
                             if needs_approval {
+                                // In non-DM relay channels, auto-deny approval-
+                                // requiring tools to prevent stuck AwaitingApproval
+                                // state and prompt injection from other users.
+                                let is_relay = message.channel.ends_with("-relay");
+                                let is_dm = message
+                                    .metadata
+                                    .get("event_type")
+                                    .and_then(|v| v.as_str())
+                                    == Some("direct_message");
+                                if is_relay && !is_dm {
+                                    tracing::info!(
+                                        tool = %tc.name,
+                                        channel = %message.channel,
+                                        "Auto-denying approval-requiring tool in non-DM relay channel"
+                                    );
+                                    let pf_idx = preflight.len();
+                                    preflight.push((tc.clone(), PreflightOutcome::Runnable));
+                                    // Insert a synthetic error result
+                                    let result_msg = format!(
+                                        "Tool '{}' requires approval and cannot run in shared channels. \
+                                         Ask the user to message me directly (DM) to use this tool.",
+                                        tc.name
+                                    );
+                                    context_messages.push(ChatMessage::tool_result(
+                                        &tc.id,
+                                        &tc.name,
+                                        &result_msg,
+                                    ));
+                                    // Mark as handled so we don't return NeedApproval
+                                    let _ = pf_idx;
+                                    continue;
+                                }
+
                                 approval_needed = Some((idx, tc, tool));
                                 break; // remaining tools are deferred
                             }
