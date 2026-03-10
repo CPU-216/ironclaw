@@ -275,14 +275,20 @@ jobs:
           for manifest in registry/tools/*.json registry/channels/*.json; do
             [ -f "$manifest" ] || continue
 
-            name=$(jq -r '.name' "$manifest")
+            # file_stem: JSON filename without extension (e.g. "slack" for slack.json).
+            # Used for the bundle filename and CI manifest lookup, so patching always
+            # finds the right file regardless of whether manifest.name matches the filename.
+            file_stem=$(basename "$manifest" .json)
+            # ext_name: the manifest's .name field (e.g. "slack-tool").
+            # Used for file names *inside* the archive — the installer extracts by manifest.name.
+            ext_name=$(jq -r '.name' "$manifest")
             source_dir=$(jq -r '.source.dir' "$manifest")
             caps_file=$(jq -r '.source.capabilities' "$manifest")
             crate_name=$(jq -r '.source.crate_name' "$manifest")
             ext_version=$(jq -r '.version // ""' "$manifest")
 
             if [ ! -d "$source_dir" ]; then
-              echo "::warning::Source dir '$source_dir' not found for '$name', skipping"
+              echo "::warning::Source dir '$source_dir' not found for '$file_stem', skipping"
               continue
             fi
 
@@ -295,15 +301,15 @@ jobs:
             url_version=$(echo "$existing_url" | sed -n 's/.*-\([0-9].*\)-wasm32-wasip2\.tar\.gz$/\1/p')
 
             if [[ -n "$ext_version" && "$url_version" == "$ext_version" && -n "$existing_sha" ]]; then
-              echo "=== Skipping $name v$ext_version — already checksummed at $existing_url ==="
+              echo "=== Skipping $file_stem v$ext_version — already checksummed at $existing_url ==="
               continue
             fi
 
-            echo "=== Building $name v$ext_version from $source_dir ==="
+            echo "=== Building $file_stem ($ext_name) v$ext_version from $source_dir ==="
 
             # Build WASM component
             cargo component build --release --manifest-path "$source_dir/Cargo.toml" || {
-              echo "::warning::Build failed for '$name', skipping"
+              echo "::warning::Build failed for '$file_stem', skipping"
               continue
             }
 
@@ -319,36 +325,36 @@ jobs:
             done
 
             if [ -z "$wasm_path" ]; then
-              echo "::warning::No WASM output found for '$name', skipping"
+              echo "::warning::No WASM output found for '$file_stem', skipping"
               continue
             fi
 
-            # Copy files with standardized names for the archive
-            cp "$wasm_path" "target/wasm-bundles/${name}.wasm"
+            # Archive contents use ext_name (manifest .name) — the installer extracts
+            # files by manifest.name, so these must match even when file_stem differs.
+            cp "$wasm_path" "target/wasm-bundles/${ext_name}.wasm"
 
             caps_path="$source_dir/$caps_file"
             if [ -f "$caps_path" ]; then
-              cp "$caps_path" "target/wasm-bundles/${name}.capabilities.json"
+              cp "$caps_path" "target/wasm-bundles/${ext_name}.capabilities.json"
             else
-              echo "::warning::No capabilities file at '$caps_path' for '$name'"
+              echo "::warning::No capabilities file at '$caps_path' for '$file_stem'"
             fi
 
-            # Create tar.gz bundle with version in the filename so each version's
-            # artifact is immutable — URLs can be pinned to a specific release tag
-            # without risk of the checksum changing when newer releases rebuild the same source.
-            bundle="target/wasm-bundles/${name}-${ext_version}-wasm32-wasip2.tar.gz"
-            (cd target/wasm-bundles && if [ -f "${name}.capabilities.json" ]; then
-              tar czf "${name}-${ext_version}-wasm32-wasip2.tar.gz" "${name}.wasm" "${name}.capabilities.json"
+            # Bundle filename uses file_stem so CI patching can find the manifest by
+            # filename (e.g. slack-0.1.0-wasm32-wasip2.tar.gz → registry/tools/slack.json).
+            bundle="target/wasm-bundles/${file_stem}-${ext_version}-wasm32-wasip2.tar.gz"
+            (cd target/wasm-bundles && if [ -f "${ext_name}.capabilities.json" ]; then
+              tar czf "${file_stem}-${ext_version}-wasm32-wasip2.tar.gz" "${ext_name}.wasm" "${ext_name}.capabilities.json"
             else
-              tar czf "${name}-${ext_version}-wasm32-wasip2.tar.gz" "${name}.wasm"
+              tar czf "${file_stem}-${ext_version}-wasm32-wasip2.tar.gz" "${ext_name}.wasm"
             fi)
 
             # Compute SHA256
             sha256=$(sha256sum "$bundle" | cut -d' ' -f1)
-            echo "$sha256  ${name}-${ext_version}-wasm32-wasip2.tar.gz" >> target/wasm-bundles/checksums.txt
+            echo "$sha256  ${file_stem}-${ext_version}-wasm32-wasip2.tar.gz" >> target/wasm-bundles/checksums.txt
 
             # Clean up intermediate files
-            rm -f "target/wasm-bundles/${name}.wasm" "target/wasm-bundles/${name}.capabilities.json"
+            rm -f "target/wasm-bundles/${ext_name}.wasm" "target/wasm-bundles/${ext_name}.capabilities.json"
 
             echo "  -> $bundle ($sha256)"
           done
