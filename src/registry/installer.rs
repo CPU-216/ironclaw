@@ -28,9 +28,7 @@ fn should_attempt_source_fallback(err: &RegistryError) -> bool {
         //
         // Version-pinned URLs (`releases/download/vX.Y.Z/`) point to an immutable
         // asset; a mismatch there is genuinely suspicious and remains a hard block.
-        RegistryError::ChecksumMismatch { url, .. } => {
-            url.contains("/releases/latest/download/")
-        }
+        RegistryError::ChecksumMismatch { url, .. } => url.contains("/releases/latest/download/"),
         // Never fall back for these — they signal a structural problem or a
         // deliberate "already done" state, not a transient artifact issue.
         RegistryError::AlreadyInstalled { .. } | RegistryError::InvalidManifest { .. } => false,
