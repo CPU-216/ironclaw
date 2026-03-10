@@ -279,6 +279,14 @@ mod tests {
         let llm = Arc::new(TraceLlm::from_trace(trace));
         let (notify_tx, _notify_rx) = tokio::sync::mpsc::channel(16);
 
+        // Create minimal ToolRegistry and SafetyLayer for test.
+        let tools = Arc::new(ToolRegistry::new());
+        let safety_config = SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: true,
+        };
+        let safety = Arc::new(SafetyLayer::new(&safety_config));
+
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
             db.clone(),
@@ -286,6 +294,8 @@ mod tests {
             ws,
             notify_tx,
             None,
+            tools,
+            safety,
         ));
 
         let mut filters = std::collections::HashMap::new();
